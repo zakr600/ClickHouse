@@ -29,15 +29,22 @@ using namespace DB;
 
 namespace
 {
-std::string tempDir()
+/// A directory the regions can actually live in. They need `O_TMPFILE` and `posix_fallocate`, which
+/// not every filesystem provides: `/dev/shm` is tmpfs, always provides both, and is where the feature
+/// puts its regions by default, so prefer it and fall back to the system temporary directory only
+/// where there is no `/dev/shm` at all.
+std::string regionDir()
 {
-    return std::filesystem::temp_directory_path().string();
+    static const std::string dir = std::filesystem::is_directory("/dev/shm")
+        ? std::string("/dev/shm")
+        : std::filesystem::temp_directory_path().string();
+    return dir;
 }
 }
 
 TEST(SharedMemoryRegion, CreateReadWrite)
 {
-    SharedMemoryRegion region(tempDir(), 4096);
+    SharedMemoryRegion region(regionDir(), 4096);
 
     EXPECT_EQ(region.size(), 4096u);
     EXPECT_NE(region.data(), nullptr);
@@ -57,7 +64,7 @@ TEST(SharedMemoryRegion, CreateReadWrite)
 /// guards the atomic open(O_TMPFILE | O_CLOEXEC) creation against regression.
 TEST(SharedMemoryRegion, BackingDescriptorIsCloseOnExec)
 {
-    SharedMemoryRegion region(tempDir(), 4096);
+    SharedMemoryRegion region(regionDir(), 4096);
 
     struct stat region_stat;
     ASSERT_EQ(::stat(region.path().c_str(), &region_stat), 0);
@@ -86,7 +93,7 @@ TEST(SharedMemoryRegion, ReclaimsLeftoverRegionFiles)
 {
     /// A fresh directory keeps the test isolated from other region creation in this process.
     const std::string directory
-        = tempDir() + "/clickhouse_shm_leftovers_" + std::to_string(::getpid()) + "_" + getRandomASCIIString(16);
+        = regionDir() + "/clickhouse_shm_leftovers_" + std::to_string(::getpid()) + "_" + getRandomASCIIString(16);
     std::filesystem::create_directories(directory);
     SCOPE_EXIT({ std::filesystem::remove_all(directory); });
     ASSERT_EQ(::chmod(directory.c_str(), 0700), 0);
@@ -150,7 +157,7 @@ TEST(SharedMemoryRegion, ReclaimsLeftoverRegionFiles)
 
 TEST(SharedMemoryRegion, SizeZeroThrows)
 {
-    EXPECT_THROW(SharedMemoryRegion(tempDir(), 0), DB::Exception);
+    EXPECT_THROW(SharedMemoryRegion(regionDir(), 0), DB::Exception);
 }
 
 TEST(SharedMemoryRegion, UnsupportedDirectoryRejectedDuringConfigurationValidation)
@@ -162,7 +169,7 @@ TEST(SharedMemoryRegion, UnsupportedDirectoryRejectedDuringConfigurationValidati
 TEST(SharedMemoryRegion, SharedDirectoryWithoutStickyBitRejected)
 {
     const std::string directory
-        = tempDir() + "/clickhouse_shm_unsafe_permissions_" + std::to_string(::getpid()) + "_" + getRandomASCIIString(16);
+        = regionDir() + "/clickhouse_shm_unsafe_permissions_" + std::to_string(::getpid()) + "_" + getRandomASCIIString(16);
     std::filesystem::create_directories(directory);
     SCOPE_EXIT({ std::filesystem::remove_all(directory); });
     ASSERT_EQ(::chmod(directory.c_str(), 0777), 0);
@@ -184,14 +191,14 @@ TEST(SharedMemoryRegion, SharedDirectoryWithoutStickyBitRejected)
 TEST(SharedMemoryRegion, OversizedThrows)
 {
     const size_t too_large = static_cast<size_t>(std::numeric_limits<off_t>::max()) + 1;
-    EXPECT_THROW(SharedMemoryRegion(tempDir(), too_large), DB::Exception);
+    EXPECT_THROW(SharedMemoryRegion(regionDir(), too_large), DB::Exception);
 }
 
 TEST(SharedMemoryRegion, UnlinkOnDestroy)
 {
     std::string path;
     {
-        SharedMemoryRegion region(tempDir(), 1024);
+        SharedMemoryRegion region(regionDir(), 1024);
         path = region.path();
         EXPECT_TRUE(std::filesystem::exists(path));
     }
@@ -202,7 +209,7 @@ TEST(SharedMemoryRegion, UnlinkOnDestroy)
 /// process does) observes writes made through the region, and vice versa.
 TEST(SharedMemoryRegion, SharedAcrossMappings)
 {
-    SharedMemoryRegion region(tempDir(), 4096);
+    SharedMemoryRegion region(regionDir(), 4096);
 
     int fd = ::open(region.path().c_str(), O_RDWR);
     ASSERT_NE(fd, -1);
@@ -230,7 +237,7 @@ TEST(SharedMemoryRegion, SharedAcrossMappings)
 /// does on its next request).
 TEST(SharedMemoryRegion, GrowPreservesDataAndEnlargesFile)
 {
-    SharedMemoryRegion region(tempDir(), 1024);
+    SharedMemoryRegion region(regionDir(), 1024);
     const std::string path = region.path();
 
     const std::string payload = "payload-before-growth";
@@ -257,7 +264,7 @@ TEST(SharedMemoryRegion, GrowPreservesDataAndEnlargesFile)
 
 TEST(SharedMemoryRegion, GrowToSmallerOrEqualThrows)
 {
-    SharedMemoryRegion region(tempDir(), 4096);
+    SharedMemoryRegion region(regionDir(), 4096);
     EXPECT_THROW(region.grow(4096), DB::Exception);
     EXPECT_THROW(region.grow(1024), DB::Exception);
     EXPECT_EQ(region.size(), 4096u);
@@ -269,7 +276,7 @@ TEST(SharedMemoryRegion, GrowToSmallerOrEqualThrows)
 /// region and a mapping made by another process.
 TEST(SharedMemoryRegion, ShrinkReleasesBackingFileAndKeepsPrefix)
 {
-    SharedMemoryRegion region(tempDir(), 8192);
+    SharedMemoryRegion region(regionDir(), 8192);
     const std::string path = region.path();
 
     const std::string payload = "payload-before-shrink";
@@ -333,7 +340,7 @@ TEST(SharedMemoryRegion, GrowRollsBackFileSizeOnReserveFailure)
 /// handoff is fully synchronized, so the access is race-free (a clean target for ThreadSanitizer).
 TEST(SharedMemoryRegion, SynchronizedHandoff)
 {
-    SharedMemoryRegion region(tempDir(), 4096);
+    SharedMemoryRegion region(regionDir(), 4096);
 
     std::mutex mutex;
     std::condition_variable cv;
