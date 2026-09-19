@@ -2160,7 +2160,7 @@ namespace
                 /// given at its declaration.
                 if (command_holder)
                 {
-                    const bool worker_is_reused = command_holder->hasReturnedCommand();
+                    worker_is_reused = command_holder->hasReturnedCommand();
                     command = command_holder->buildCommand();
 
                     /// A worker that exited while it sat in the pool is replaced before anything
@@ -2187,6 +2187,7 @@ namespace
 
                         command.reset();
                         command = command_holder->buildCommand();
+                        worker_is_reused = false;
                     }
 
                     /// A worker that wrote to its stdout after it was handed back is replaced as
@@ -2216,6 +2217,7 @@ namespace
                         command->in.close();
                         command.reset();
                         command = command_holder->buildCommand();
+                        worker_is_reused = false;
                     }
 
                     /// Borrow acquired: capture the pid for procfs sampling. Best-effort, and it
@@ -3152,7 +3154,11 @@ namespace
 
         void discardStderrLeftByAPreviousBorrow()
         {
-            if (!is_pooled)
+            /// Only a worker that served an earlier borrow can have left anything: a process
+            /// started for this borrow (or just now, as a replacement) has no previous invocation,
+            /// and what it writes at startup is this query's - under `throw` it fails it, as on
+            /// the pipe path.
+            if (!is_pooled || !worker_is_reused)
                 return;
 
             static constexpr size_t stderr_drain_budget_ms = 100;
@@ -3626,6 +3632,9 @@ namespace
         bool command_can_be_reused = false;
 
         bool is_pooled;
+        /// Whether the process served an earlier borrow (and may have left output on its pipes),
+        /// as opposed to one started for this borrow or as a replacement during it.
+        bool worker_is_reused = false;
         size_t shared_memory_max_size;
         /// The cap in the unit footprints come in - whole pages: a region of 16 bytes holds a page,
         /// and a cap of 16 bytes has to mean that page, not fail it on every borrow.

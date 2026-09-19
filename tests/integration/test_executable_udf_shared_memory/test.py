@@ -1593,6 +1593,21 @@ def test_shared_memory_udf_none_reaction_worker_flooding_after_a_quiet_gap(start
     assert len(pids) == 1, f"the worker was not reused: {pids}"
 
 
+def test_shared_memory_udf_startup_stderr_of_a_fresh_pooled_worker_fails_the_query(started_cluster):
+    skip_test_msan(node)
+
+    # The command logs a line to stderr as it starts, before it reads its first request. The
+    # process is new for this borrow, so that line is this query's and nobody else's: under
+    # `throw` it fails the query, exactly as the pipe transport does. Taking it for a previous
+    # invocation's leftovers - the borrow-start cleanup does that for a worker that served an
+    # earlier borrow - would log it against nobody and let the query succeed, and `throw` would
+    # then mean something different on the two transports.
+    with pytest.raises(Exception) as exc:
+        node.query("SELECT test_function_shm_stderr_at_startup_throw_pool_python(1)")
+    assert "Executable generates stderr" in str(exc.value), str(exc.value)
+    assert "starting up" in str(exc.value), str(exc.value)
+
+
 def test_shared_memory_udf_none_reaction_worker_is_not_left_blocked_on_stderr(started_cluster):
     skip_test_msan(node)
 
