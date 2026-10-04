@@ -1,7 +1,12 @@
 #!/usr/bin/python3
 
-# A pooled shared-memory UDF that reports whether the region past its input is clean, and then
-# dirties it. Otherwise identical to shm_udf.py.
+# A pooled shared-memory UDF that answers correctly and then hides holes in its region's file from
+# the footprint: it frees every page past its answer with `fallocate(FALLOC_FL_PUNCH_HOLE |
+# FALLOC_FL_KEEP_SIZE)` and commits as many pages past the end of the file with
+# `fallocate(FALLOC_FL_KEEP_SIZE)`. The file keeps its length and its number of committed pages, so
+# a server that measures the region by those two sees nothing - until something writes into the
+# holes and the kernel allocates them again. Otherwise identical to shm_udf.py. What the server
+# does about it is the test's business.
 #
 # Protocol (all control values use the ClickHouse native binary encoding):
 #   server -> stdin : varint version, varint request id, varint path length + path bytes,
@@ -13,6 +18,7 @@
 # The bulk data lives in the shared-memory file at the given path; the pipes carry only
 # these small control commands. When stdin reaches EOF the process exits.
 
+import ctypes
 import mmap
 import os
 import sys
@@ -65,30 +71,39 @@ def write_string_binary(stream, text):
 
 
 def process(input_data, region, region_size):
-    # Reports, for every input row, whether the region past this request's input still holds
-    # anything: "clean" if the 4 KiB right after the input are all zero, "dirty" otherwise. A
-    # previous request's larger input or output leaves its bytes there unless the server scrubbed
-    # them; this is how the test sees whether it did. Then overwrites that stretch, so that the next
-    # request finds it dirty unless scrubbed again.
-    probe_from = len(input_data)
-    probe = bytes(region[probe_from : probe_from + 4096])
-    verdict = b"clean" if probe.strip(b"\x00") == b"" else b"dirty"
     output = bytearray()
     for line in input_data.split(b"\n"):
         if line == b"":
             continue
-        output += verdict + b"\n"
-    region[probe_from : probe_from + 4096] = b"x" * 4096
+        output += b"Key " + line + b"\n"
 
     output_offset = len(input_data)  # write the result right after the input
     if output_offset + len(output) > region_size:
-        # Only the server can resize the region: ask it for one that fits and it re-sends the
-        # same request over the larger mapping.
         raise NeedMoreSpace(output_offset + len(output))
 
     region[output_offset : output_offset + len(output)] = bytes(output)
     region.flush()
     return output_offset, len(output)
+
+
+FALLOC_FL_KEEP_SIZE = 0x01
+FALLOC_FL_PUNCH_HOLE = 0x02
+
+
+def hide_holes(fd, offset):
+    # Frees every page from `offset` (rounded up to a page) to the end of the file, and commits as
+    # many pages right past the end of the file. Length and committed pages stay what they were.
+    page = mmap.PAGESIZE
+    offset = (offset + page - 1) // page * page
+    size = os.fstat(fd).st_size
+    if offset >= size:
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64]
+    if libc.fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, size - offset) != 0:
+        raise OSError(ctypes.get_errno(), "fallocate(FALLOC_FL_PUNCH_HOLE) failed")
+    if libc.fallocate(fd, FALLOC_FL_KEEP_SIZE, size, size - offset) != 0:
+        raise OSError(ctypes.get_errno(), "fallocate(FALLOC_FL_KEEP_SIZE) failed")
 
 
 def main():
@@ -113,15 +128,22 @@ def main():
             fd = os.open(path, os.O_RDWR)
             try:
                 region = mmap.mmap(fd, 0)
+                try:
+                    region_size = len(region)
+                    input_data = region[input_offset : input_offset + input_size]
+                    output_offset, output_size = process(input_data, region, region_size)
+                finally:
+                    region.close()
             finally:
                 os.close(fd)
 
+            # Before the response goes out, so that the layout is in place the moment the query
+            # returns. Not the answer itself - the server is about to read it.
+            punch_fd = os.open(path, os.O_RDWR)
             try:
-                region_size = len(region)
-                input_data = region[input_offset : input_offset + input_size]
-                output_offset, output_size = process(input_data, region, region_size)
+                hide_holes(punch_fd, output_offset + output_size)
             finally:
-                region.close()
+                os.close(punch_fd)
 
             write_varint(stdout, request_id)
             write_varint(stdout, STATUS_OK)

@@ -2844,8 +2844,7 @@ namespace
 
                 /// Closed before the process is dropped, so that one that only closed its stdout and
                 /// exits on EOF does so at once rather than sitting out the termination timeout.
-                worker->closeInputs();
-                command_holder->discardWorkerAndRegion();
+                discardPooledWorkerBeforeTheBorrow(*worker);
                 return;
             }
 
@@ -2865,8 +2864,7 @@ namespace
 
                 /// Closed before the process is dropped, so that a worker written to exit on EOF does
                 /// so at once rather than sitting out the termination timeout in the destructor.
-                worker->closeInputs();
-                command_holder->discardWorkerAndRegion();
+                discardPooledWorkerBeforeTheBorrow(*worker);
                 return;
             }
 
@@ -2896,7 +2894,25 @@ namespace
             /// Closed before the process is dropped, like above. A worker blocked writing its stderr
             /// does not wait out the termination timeout either: the destructor closes the read end
             /// of the pipe before it waits, and the blocked `write` fails.
-            worker->closeInputs();
+            discardPooledWorkerBeforeTheBorrow(*worker);
+        }
+
+        /// Drops a worker `inspectPooledWorkerBeforeTheBorrow` found unfit, together with its region.
+        /// Its inputs are closed first, so that a process written to exit on EOF does so at once.
+        /// Closing can throw, and can have closed some of the descriptors by then - and the worker
+        /// has to go either way: a holder still holding its process would hand it back to the pool
+        /// when the constructor unwinds, half-closed, for the next borrow to be built on.
+        void discardPooledWorkerBeforeTheBorrow(ShellCommand & worker)
+        {
+            try
+            {
+                worker.closeInputs();
+            }
+            catch (...)
+            {
+                command_holder->discardWorkerAndRegion();
+                throw;
+            }
             command_holder->discardWorkerAndRegion();
         }
 
@@ -3250,8 +3266,37 @@ namespace
             if (command_holder->lastBorrower() && *command_holder->lastBorrower() != borrower
                 && shared_memory_region && !region_created_by_this_borrow)
             {
-                memset(shared_memory_region->data(), 0, shared_memory_region->size());
-                ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryScrubbedBytes, shared_memory_region->size());
+                auto & region = *shared_memory_region;
+
+                /// The scrub writes every page of the mapping, and a page the command freed under the
+                /// file's length is allocated again by that write. The footprint the borrow was charged
+                /// for cannot see such holes when the command committed as many pages past the end of
+                /// the file (`SharedMemoryRegion::fillCostUpTo`), so the query is charged for the worst
+                /// case - every page of the mapping missing - before the write, like a growth
+                /// (`ensureRegionFits`), and the charge is settled against the footprint re-read after
+                /// it. A refill that took the footprint past the cap is a region the command made over
+                /// the cap: the borrow fails closed, with the worker and its region. May throw the
+                /// memory limit before anything is written, and then the region is left as it was,
+                /// still recorded as the previous borrower's.
+                const size_t charged_before = query_memory_charge;
+                const size_t worst_case = SharedMemoryRegion::roundUpToPages(region.size());
+                chargeQueryMemory(worst_case);
+
+                memset(region.data(), 0, region.size());
+                ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryScrubbedBytes, region.size());
+
+                const size_t charged = charged_before + worst_case;
+                const size_t footprint_after = refreshFootprintKeepingTheChargeOnFailure(region, charged);
+                if (region.isOverTheCap(shared_memory_max_size))
+                    failBorrowOnRegionOverTheCap(std::max(region.backingSize(), region.costOnceMappedWhole()));
+
+                /// Never below what the borrow was charged before the scrub: that charge was made
+                /// for the region as it was handed over, and the scrub does not free anything.
+                const size_t settled = std::max(charged_before, footprint_after);
+                if (settled < charged)
+                    unchargeQueryMemory(charged - settled);
+                else if (settled > charged)
+                    chargeQueryMemory(settled - charged);
             }
             command_holder->recordBorrower(std::move(borrower));
         }
