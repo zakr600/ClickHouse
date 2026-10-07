@@ -918,10 +918,10 @@ public:
         /// destroyed after this body - which would drop the charge while the worker still holds
         /// the pages, for the whole wait `~ShellCommand` starts with. Its stdin is closed first,
         /// so that a worker written to exit on EOF does so at once rather than sitting out
-        /// `command_termination_timeout` blocked on its next request. Past that budget the worker
-        /// is signalled and not waited for, and a descendant may have kept the inherited
-        /// descriptors - the limits described in the note on the cap in
-        /// `docs/reference/functions/regular-functions/udf.mdx`.
+        /// `command_termination_timeout` blocked on its next request. Past that budget a
+        /// shared-memory worker's process group is sent `SIGKILL` and the worker reaped
+        /// (`ShellCommand::Config::own_process_group`), so nothing in it can write into the region
+        /// once the charge below is gone.
         if (returned_command)
         {
             /// `closeInputs` flushes and closes the pipes and throws on failure; this destructor
@@ -1811,10 +1811,24 @@ namespace
                 tryLogCurrentException("ShellCommandSource");
             }
 
-            if (!timeout_command_out.channelState().stdout_has_unread_output)
+            const auto state = timeout_command_out.channelState();
+            if (!state.stdout_has_unread_output && !state.stdout_hung_up)
                 return;
 
             command_is_invalid = true;
+
+            /// So is a stdout that has hung up. `createPipe` replaces a worker it finds exited, but
+            /// one that exits between that look and this one is past replacing - the pipes this
+            /// source reads are already its - and the request below would go to a process that
+            /// cannot answer, failing this query obscurely, on a write to a closed stdin, for an
+            /// exit that happened while the worker sat idle. It fails here instead, saying so, and
+            /// the worker does not go back to the pool: the next query starts a replacement.
+            if (!state.stdout_has_unread_output)
+                throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
+                    "The process of a pooled command closed its stdout (it exited, or hung it up) after it was "
+                    "checked at the borrow and before this query sent it anything, so it cannot answer; the query "
+                    "fails and the process is discarded. The next query starts a replacement");
+
             throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
                 "A pooled command had unread output on its stdout when it was borrowed, so it was written "
                 "after the response to an earlier invocation. This transport has no way to tell those bytes "
@@ -3741,13 +3755,14 @@ namespace
                     /// goes with them. Its stdin was closed above, so this is where a worker
                     /// written to exit on EOF exits, and `~ShellCommand` starts by waiting for it -
                     /// whatever is left of `command_termination_timeout`. When the budget runs out
-                    /// the destructor signals the process and does not wait for the signal to land,
-                    /// so it may still be running - and holding the region's descriptor, or a
-                    /// descendant may - when the region is dropped below. That does not keep the
-                    /// pages past the charge: the region frees every page of its file when it is
-                    /// destroyed (`~SharedMemoryRegion`), whoever else still holds it, and a process
-                    /// that writes into it after that allocates pages of its own (see the note on
-                    /// the cap in `docs/reference/functions/regular-functions/udf.mdx`).
+                    /// the destructor sends `SIGKILL` to the worker's whole process group and reaps
+                    /// the worker (`ShellCommand::Config::own_process_group`): neither the worker nor
+                    /// a descendant still in its group runs again, so nothing can write into the
+                    /// region after the charge below is dropped. The region then frees every page
+                    /// of its file as it is destroyed (`~SharedMemoryRegion`). What is out of reach is
+                    /// a descendant that left the group, or one left behind by a worker that had
+                    /// already exited and been reaped (see the note on the cap in
+                    /// `docs/reference/functions/regular-functions/udf.mdx`).
                     command = nullptr;
 
                     shared_memory_region.reset();
@@ -3974,6 +3989,14 @@ Pipe ShellCommandSourceCoordinator::createPipe(
     command_config.terminate_in_destructor_strategy = destructor_strategy;
 
     command_config.register_in_udf_process_registry = configuration.is_user_defined_function;
+
+    /// A shared-memory command shares its region with the server, and the server stops charging
+    /// for the region when it drops the process. A process that outlived its termination signal,
+    /// or a descendant that inherited the descriptor, could still write into the region after that
+    /// and take pages nobody is charged for. So such a command runs in a process group of its own,
+    /// and dropping it ends the group with `SIGKILL` before the region goes (see
+    /// `ShellCommand::Config::own_process_group`).
+    command_config.own_process_group = configuration.use_shared_memory;
 
     bool is_executable_pool = (process_pool != nullptr);
 

@@ -1,11 +1,12 @@
 #!/usr/bin/python3
 
-# A pooled shared-memory UDF that outlives its own discarding. It answers its request with a stray
-# byte after the response frame - in the same write, so the server's hand-back probe is sure to see
-# it and discard the worker - and when its stdin reaches EOF it does not exit: it ignores `SIGTERM`
-# and, for a few seconds, writes how many bytes of pages its own copy of the region's descriptor
-# still has behind it to the file named by its argument. A process the server has given up on keeps
-# the descriptor it inherited; what the test looks at is whether it keeps the pages too.
+# A pooled shared-memory UDF whose process tree outlives its own discarding unless the server ends
+# it. At startup it forks a descendant that keeps the inherited descriptor of the region (and
+# nothing else), ignores `SIGTERM` and sleeps. It answers its request with a stray byte after the
+# response frame - in the same write, so the server's hand-back probe is sure to see it and discard
+# the worker - and when its stdin reaches EOF it does not exit either: it ignores `SIGTERM` and
+# sleeps. Both write their pids, as `worker` and `descendant`, into the directory named by the
+# argument. Either of them alive after the server dropped the region could still write into it.
 #
 # Protocol (all control values use the ClickHouse native binary encoding):
 #   server -> stdin : varint version, varint request id, varint path length + path bytes,
@@ -123,22 +124,36 @@ def process(input_data, region, region_size):
 REGION_FD = 3
 
 
-def linger():
-    # Discarded: the server closed stdin. Stay, deaf to `SIGTERM`, and report the pages behind the
-    # inherited descriptor of the region - `st_blocks` is in 512-byte units.
+def write_pid(directory, name):
+    with open(os.path.join(directory, name + ".tmp"), "w") as out:
+        out.write(f"{os.getpid()}\n")
+    os.rename(os.path.join(directory, name + ".tmp"), os.path.join(directory, name))
+
+
+def start_descendant(directory):
+    if os.fork() != 0:
+        return
+    # The descendant: the region's descriptor and nothing else, deaf to `SIGTERM`.
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    report = sys.argv[1]
-    for _ in range(100):
-        committed = os.fstat(REGION_FD).st_blocks * 512
-        with open(report + ".tmp", "w") as out:
-            out.write(f"{committed}\n")
-        os.rename(report + ".tmp", report)
-        time.sleep(0.1)
+    os.closerange(0, REGION_FD)
+    os.closerange(REGION_FD + 1, 1024)
+    write_pid(directory, "descendant")
+    time.sleep(60)
+    os._exit(0)
+
+
+def linger():
+    # Discarded: the server closed stdin. Stay, deaf to `SIGTERM`, holding the region.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    time.sleep(60)
 
 
 def main():
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
+
+    start_descendant(sys.argv[1])
+    write_pid(sys.argv[1], "worker")
 
     while True:
         version = read_varint(stdin)

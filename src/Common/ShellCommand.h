@@ -95,6 +95,16 @@ public:
         /// from spawn until reaped. Off by default; enabled only for executable
         /// and executable_pool UDFs.
         bool register_in_udf_process_registry = false;
+
+        /// When true, the child is started in a process group of its own (`setpgid(0, 0)` before
+        /// `exec`), and the destructor ends that whole group rather than one process: once the
+        /// wait for a normal exit is over (`terminate_in_destructor_strategy`), every process
+        /// still in the group - the child, or descendants it left behind - is sent `SIGKILL`, and
+        /// the child is reaped. For a child that shares something with the server that the server
+        /// is about to stop accounting for (the region of a shared-memory UDF): after `SIGKILL`
+        /// nothing in the group runs user code again, so nothing can write into it any more. A
+        /// descendant that left the group (`setsid`, `setpgid`) is out of reach.
+        bool own_process_group = false;
     };
 
     pid_t getPid() const
@@ -228,6 +238,16 @@ private:
     Config config;
     bool wait_called = false;
     bool do_not_terminate = false;
+
+    /// Whether the child has actually been reaped. Not the same as `wait_called`, which a bounded
+    /// wait sets before it starts and leaves set when it runs out with the child still alive. As
+    /// long as this is false the child's pid - and the number of the group it leads, with
+    /// `Config::own_process_group` - is still its own and cannot belong to anything else.
+    bool child_reaped = false;
+
+    /// Sends `SIGKILL` to the child's process group and reaps the child (`Config::own_process_group`).
+    /// Only while the child is not reaped: after that the number may already name somebody else.
+    void killProcessGroupAndReapNoThrow() noexcept;
 
     /// CPU time of the reaped child, taken from `wait4` rusage and stored by value
     /// at reap time. The reap path performs no allocation, so a memory-limit

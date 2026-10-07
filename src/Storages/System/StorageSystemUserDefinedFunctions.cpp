@@ -76,7 +76,8 @@ ColumnsDescription StorageSystemUserDefinedFunctions::getColumnsDescription()
         {"command_write_timeout", std::make_shared<DataTypeUInt64>(),
             "Milliseconds for writing to command stdin."},
         {"command_pipe_capacity", std::make_shared<DataTypeUInt64>(),
-            "Capacity in bytes asked of the pipes to the command. 0 keeps the kernel's default."},
+            "Capacity in bytes asked of the pipes to the command. 0 keeps the kernel's default. Linux only: "
+            "elsewhere it has no effect."},
         {"pool_size", std::make_shared<DataTypeUInt64>(),
             "Number of command process instances. Only for 'executable_pool' type."},
         {"send_chunk_header", std::make_shared<DataTypeUInt8>(),
@@ -97,7 +98,8 @@ ColumnsDescription StorageSystemUserDefinedFunctions::getColumnsDescription()
             "that has not exited by then fails the query and is signalled."},
         {"use_shared_memory", std::make_shared<DataTypeUInt8>(),
             "Whether the data is exchanged with the command through a shared-memory file instead of "
-            "the `stdin`/`stdout` pipes (boolean)."},
+            "the `stdin`/`stdout` pipes (boolean). Linux only: a function that asks for it fails to load "
+            "on other platforms."},
         {"shared_memory_size", std::make_shared<DataTypeUInt64>(),
             "Initial size in bytes of the shared-memory region. 0 when `use_shared_memory` is disabled."},
         {"shared_memory_max_size", std::make_shared<DataTypeUInt64>(),

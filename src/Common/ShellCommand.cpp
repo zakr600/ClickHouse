@@ -55,6 +55,7 @@ namespace
         DUP_WRITE_DESCRIPTOR,
         DUP_INHERITED_DESCRIPTOR,
         CLOSE_INHERITED_DESCRIPTOR,
+        SET_PROCESS_GROUP,
     };
 
     /// What the child writes into the error pipe: small enough for a single write to be atomic.
@@ -76,6 +77,7 @@ namespace
             case ChildSetupStep::DUP_WRITE_DESCRIPTOR: return "dup2 a write descriptor";
             case ChildSetupStep::DUP_INHERITED_DESCRIPTOR: return "dup2 an inherited descriptor";
             case ChildSetupStep::CLOSE_INHERITED_DESCRIPTOR: return "close the original of an inherited descriptor";
+            case ChildSetupStep::SET_PROCESS_GROUP: return "setpgid";
         }
         return "prepare";
     }
@@ -145,6 +147,14 @@ ShellCommand::~ShellCommand()
     if (do_not_terminate)
         return;
 
+    /// A group of its own is ended as a whole, whatever happened before: a bounded wait that ran
+    /// out (`wait_called` is set, the child alive), or the normal exit wait below running out. Not
+    /// once the child has been reaped - see `killProcessGroupAndReapNoThrow`.
+    SCOPE_EXIT({
+        if (config.own_process_group)
+            killProcessGroupAndReapNoThrow();
+    });
+
     if (wait_called)
         return;
 
@@ -159,6 +169,10 @@ ShellCommand::~ShellCommand()
         bool process_terminated_normally = tryWaitProcessWithTimeout(try_wait_timeout);
 
         if (process_terminated_normally)
+            return;
+
+        /// The whole group gets `SIGKILL` on the way out instead (see above).
+        if (config.own_process_group)
             return;
 
         LOG_TRACE(getLogger(), "Will kill shell command pid {} with signal {}", pid, config.terminate_in_destructor_strategy.termination_signal);
@@ -197,11 +211,44 @@ bool ShellCommand::tryWaitProcessWithTimeout(size_t timeout_in_seconds)
         fd.close();
 
     bool process_terminated_normally = waitForPid(pid, timeout_in_seconds);
+    if (process_terminated_normally)
+        child_reaped = true;
 
     if (process_terminated_normally && config.register_in_udf_process_registry)
         UDFProcessRegistry::instance().removeIfGenerationMatches(pid, udf_registry_generation);
 
     return process_terminated_normally;
+}
+
+void ShellCommand::killProcessGroupAndReapNoThrow() noexcept
+{
+    if (child_reaped)
+        return;
+
+    try
+    {
+        /// The child is not reaped, so its pid - which is the number of the group it leads - is
+        /// still its own: a signal to `-pid` reaches this group and nothing else.
+        if (0 != ::kill(-pid, SIGKILL) && errno != ESRCH)
+            LOG_WARNING(getLogger(), "Cannot kill the process group of shell command pid {}, error: '{}'", pid, errnoToString());
+
+        /// Nothing to wait out after `SIGKILL`: the child cannot run user code again, and the bound
+        /// only covers the time the kernel takes to tear it down.
+        static constexpr size_t reap_after_kill_timeout_seconds = 5;
+        wait_called = true;
+        if (waitForPid(pid, reap_after_kill_timeout_seconds))
+        {
+            child_reaped = true;
+            if (config.register_in_udf_process_registry)
+                UDFProcessRegistry::instance().removeIfGenerationMatches(pid, udf_registry_generation);
+        }
+        else
+            LOG_WARNING(getLogger(), "Shell command pid {} was not reaped within {} seconds after SIGKILL", pid, reap_after_kill_timeout_seconds);
+    }
+    catch (...)
+    {
+        tryLogCurrentException(getLogger());
+    }
 }
 
 void ShellCommand::logCommand(const char * filename, char * const argv[])
@@ -434,6 +481,13 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
         sigprocmask(0, nullptr, &mask); // NOLINT(concurrency-mt-unsafe)
         sigprocmask(SIG_UNBLOCK, &mask, nullptr); // NOLINT(concurrency-mt-unsafe)
 
+        /// A group of its own, led by this process, so that the destructor can end it together
+        /// with whatever it starts (see `Config::own_process_group`). In the child, before `exec`:
+        /// by the time `vfork` returns in the parent the group already exists, so the parent can
+        /// never signal a group that is not there yet.
+        if (config.own_process_group && 0 != ::setpgid(0, 0))
+            reportChildSetupFailureAndExit(child_error_fd, ChildSetupStep::SET_PROCESS_GROUP);
+
         execv(filename, argv);
         /// If the process is running, then `execv` does not return here.
 
@@ -648,6 +702,7 @@ ShellCommand::tryWaitResult ShellCommand::tryWaitImpl(bool blocking, bool check_
             /// moment the child is reaped — before any operation that can throw — so the
             /// destructor never waits on or signals an unrelated process.
             wait_called = true;
+            child_reaped = true;
             if (config.register_in_udf_process_registry)
                 UDFProcessRegistry::instance().removeIfGenerationMatches(pid, udf_registry_generation);
             if (config.collect_resource_usage)
