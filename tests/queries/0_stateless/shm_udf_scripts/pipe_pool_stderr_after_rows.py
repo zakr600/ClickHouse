@@ -9,8 +9,9 @@
 # The setting would then cost the command a worker while telling the user nothing, which is not what
 # it says it does.
 #
-# The diagnostic is put on the stderr pipe *before* the rows are flushed to stdout: the rows are
-# composed into the buffer first, the diagnostic goes out, and only then the buffer is flushed. From
+# The diagnostic is put on the stderr pipe *before* the rows are written to stdout - before they are
+# written at all, not merely before they are flushed: CI runs Python with `PYTHONUNBUFFERED`, where
+# every `write` goes straight to the pipe. From
 # the server's side the diagnostic is therefore already waiting whenever the rows arrive, and what
 # it can act on is deterministic. The other order - rows flushed, then the diagnostic - would leave
 # a window in which the server has its rows, looks at stderr once, and the diagnostic is still on
@@ -26,9 +27,8 @@ if __name__ == "__main__":
         if not line:
             continue
 
-        sys.stdout.write(f"Key {line}\n")
-
         sys.stderr.write("complaining right after the rows\n")
         sys.stderr.flush()
 
+        sys.stdout.write(f"Key {line}\n")
         sys.stdout.flush()

@@ -3738,21 +3738,16 @@ namespace
                     /// reference (the region dies with the last one, below) and uncharges memory.
                     ///
                     /// The process goes first, before those references and the accounting that
-                    /// goes with them: a region's pages are freed when the last descriptor to it
-                    /// is closed, and while the process is around it holds one. Its stdin was
-                    /// closed above, so this is where a worker written to exit on EOF exits, and
-                    /// `~ShellCommand` starts by waiting for it - whatever is left of
-                    /// `command_termination_timeout` - which reaps it and takes its descriptor
-                    /// with it before the charge below goes.
-                    ///
-                    /// That is as far as it goes, and not a guarantee: when the budget runs out
-                    /// the destructor signals the process and does not wait for the signal to
-                    /// land, so the charge is dropped while it may still be running - briefly for
-                    /// a command that acts on `SIGTERM`, indefinitely for one that ignores it or
-                    /// for a descendant it left holding the inherited descriptor. The pages then
-                    /// outlive the charge, as untracked as anything else a process running as the
-                    /// server's user allocates (see the note on the cap in
-                    /// `docs/reference/functions/regular-functions/udf.mdx`).
+                    /// goes with them. Its stdin was closed above, so this is where a worker
+                    /// written to exit on EOF exits, and `~ShellCommand` starts by waiting for it -
+                    /// whatever is left of `command_termination_timeout`. When the budget runs out
+                    /// the destructor signals the process and does not wait for the signal to land,
+                    /// so it may still be running - and holding the region's descriptor, or a
+                    /// descendant may - when the region is dropped below. That does not keep the
+                    /// pages past the charge: the region frees every page of its file when it is
+                    /// destroyed (`~SharedMemoryRegion`), whoever else still holds it, and a process
+                    /// that writes into it after that allocates pages of its own (see the note on
+                    /// the cap in `docs/reference/functions/regular-functions/udf.mdx`).
                     command = nullptr;
 
                     shared_memory_region.reset();

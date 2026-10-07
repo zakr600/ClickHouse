@@ -96,6 +96,29 @@ void closeNoThrow(int fd, const char * operation) noexcept
     }
 }
 
+/// Frees every page of a region's file - inside its length and past it - for whoever still holds
+/// it. A region is dropped when the server is done with it, and that is when its charge is dropped
+/// too; the pages have to go at the same moment, or the charge would be gone while they stay. They
+/// would stay as long as anything else holds the file: a command that ignored the termination
+/// signal its destructor gets, or a descendant that inherited the descriptor. Punching a hole is
+/// allowed under the seals (they forbid shrinking, not freeing), the file keeps its length, and a
+/// process that still maps it reads zeros; whatever it writes after that allocates pages of its
+/// own, as any of its memory would be.
+void releasePagesNoThrow(int fd) noexcept
+{
+    const off_t page_size = static_cast<off_t>(::sysconf(_SC_PAGESIZE));
+    const off_t whole_file = std::numeric_limits<off_t>::max() / page_size * page_size;
+    if (0 != ::fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, whole_file))
+    {
+        const int punch_errno = errno;
+        LOG_WARNING(
+            getLogger("SharedMemoryRegion"),
+            "Cannot free the pages of a shared-memory region on its destruction; they stay until the last "
+            "descriptor of it is closed: {}",
+            errnoToString(punch_errno));
+    }
+}
+
 void unmapNoThrow(void * data, size_t size, const char * operation) noexcept
 {
     if (0 != ::munmap(data, size))
@@ -411,6 +434,9 @@ SharedMemoryRegion::~SharedMemoryRegion()
     /// The destructor is implicitly noexcept and logs below, so block memory-limit exceptions: the
     /// region is usually released while its borrow is still charged for it.
     LockMemoryExceptionInThread block_exceptions(VariableContext::Global);
+
+    if (region_fd != -1)
+        releasePagesNoThrow(region_fd);
 
     if (region_data)
         unmapNoThrow(region_data, region_size, "destruction");

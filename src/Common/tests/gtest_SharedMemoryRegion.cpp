@@ -183,6 +183,38 @@ TEST(SharedMemoryRegion, ClosesDescriptorOnDestroy)
     EXPECT_EQ(errno, EBADF);
 }
 
+/// A region is dropped when the server is done with it, and its charge with it: its pages go at
+/// that moment too, whoever else still holds the file - a command that ignored its termination
+/// signal, or a descendant that inherited the descriptor. Here another descriptor and a mapping of
+/// the file outlive the region, with pages inside its length and past its end; none of them stays.
+TEST(SharedMemoryRegion, DestructionFreesPagesStillHeldByOthers)
+{
+    const size_t size = 16 * SharedMemoryRegion::roundUpToPages(1);
+    int other_fd = -1;
+    char * other_mapping = nullptr;
+    {
+        SharedMemoryRegion region(size);
+        ASSERT_EQ(::fallocate(region.fd(), FALLOC_FL_KEEP_SIZE, static_cast<off_t>(4 * size), static_cast<off_t>(size)), 0);
+        other_fd = ::fcntl(region.fd(), F_DUPFD_CLOEXEC, 0);
+        ASSERT_NE(other_fd, -1);
+        other_mapping = static_cast<char *>(::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, other_fd, 0));
+        ASSERT_NE(other_mapping, MAP_FAILED);
+        memset(other_mapping, 'x', size);
+
+        struct stat st{};
+        ASSERT_EQ(::fstat(other_fd, &st), 0);
+        EXPECT_GE(static_cast<size_t>(st.st_blocks) * 512, 2 * size);
+    }
+
+    struct stat st{};
+    ASSERT_EQ(::fstat(other_fd, &st), 0);
+    EXPECT_EQ(st.st_blocks, 0);
+    EXPECT_EQ(static_cast<size_t>(st.st_size), size);
+
+    ASSERT_EQ(::munmap(other_mapping, size), 0);
+    ASSERT_EQ(::close(other_fd), 0);
+}
+
 TEST(SharedMemoryRegion, PathForChildFd)
 {
     EXPECT_EQ(SharedMemoryRegion::pathForChildFd(3), "/proc/self/fd/3");
