@@ -1072,7 +1072,7 @@ public:
     /// `command_termination_timeout`, and the region stays resident for all of that time, so it
     /// has to stay counted. Once the borrower has taken the charge over there is nothing left here
     /// to drop, and the borrower's own charge covers the region until it is gone.
-    void discardWorkerAndRegion()
+    void discardWorkerAndRegion() noexcept
     {
         returned_command.reset();
         shared_memory.reset();
@@ -1822,12 +1822,14 @@ namespace
             /// source reads are already its - and the request below would go to a process that
             /// cannot answer, failing this query obscurely, on a write to a closed stdin, for an
             /// exit that happened while the worker sat idle. It fails here instead, saying so, and
-            /// the worker does not go back to the pool: the next query starts a replacement.
+            /// the worker does not go back to the pool: the next query starts a replacement. Not
+            /// `UNSUPPORTED_METHOD`: nothing is wrong with the command's configuration or protocol,
+            /// the process went away - most likely it exited.
             if (!state.stdout_has_unread_output)
-                throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
-                    "The process of a pooled command closed its stdout (it exited, or hung it up) after it was "
-                    "checked at the borrow and before this query sent it anything, so it cannot answer; the query "
-                    "fails and the process is discarded. The next query starts a replacement");
+                throw Exception(ErrorCodes::UDF_EXECUTION_FAILED,
+                    "The stdout of the process of a pooled command hung up (most likely the process exited) after "
+                    "it was checked at the borrow and before this query sent it anything, so it cannot answer; the "
+                    "query fails and the process is discarded. The next query starts a replacement");
 
             throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
                 "A pooled command had unread output on its stdout when it was borrowed, so it was written "
@@ -2222,6 +2224,8 @@ namespace
                 {
                     if (const auto * over = command_holder->sharedMemoryRegionOverTheCap(shared_memory_max_size))
                     {
+                        /// Discarded even if the log line throws: see `discardPooledWorkerBeforeTheBorrow`.
+                        SCOPE_EXIT({ command_holder->discardWorkerAndRegion(); });
                         LOG_WARNING(
                             getLogger("ShellCommandSharedMemorySource"),
                             "The process of an executable UDF has grown its shared-memory region to {} bytes "
@@ -2229,7 +2233,6 @@ namespace
                             "shared_memory_max_size ({} bytes); the process and its region are discarded and this "
                             "borrow starts a fresh one",
                             std::max(over->backingSize(), over->costOnceMappedWhole()), shared_memory_max_size);
-                        command_holder->discardWorkerAndRegion();
                     }
                 }
 
@@ -2838,47 +2841,45 @@ namespace
 
             if (pooledProcessHasExitedCleanly(*worker))
             {
-                /// Whatever it said on its way out is read and reported now, before the process is
-                /// dropped with its pipes: nobody else will ever read it.
-                const String leftover_stderr = readLeftoverStderrOfExitedProcess(*worker);
-                if (leftover_stderr.empty())
-                    LOG_DEBUG(
-                        getLogger("ShellCommandSharedMemorySource"),
-                        "The process of an executable UDF (pid {}) exited while it was idle in the pool; "
-                        "it is discarded, with its region, and a replacement is started for this borrow.",
-                        worker->getPid());
-                else
-                    LOG_WARNING(
-                        getLogger("ShellCommandSharedMemorySource"),
-                        "The process of an executable UDF (pid {}) exited while it was idle in the pool, "
-                        "after writing to its stderr; it is discarded, with its region, and a replacement is "
-                        "started for this borrow. Stderr: {}",
-                        worker->getPid(),
-                        leftover_stderr);
-
-                /// Closed before the process is dropped, so that one that only closed its stdout and
-                /// exits on EOF does so at once rather than sitting out the termination timeout.
-                discardPooledWorkerBeforeTheBorrow(*worker);
+                discardPooledWorkerBeforeTheBorrow(*worker, [&]
+                {
+                    /// Whatever it said on its way out is read and reported now, before the process
+                    /// is dropped with its pipes: nobody else will ever read it.
+                    const String leftover_stderr = readLeftoverStderrOfExitedProcess(*worker);
+                    if (leftover_stderr.empty())
+                        LOG_DEBUG(
+                            getLogger("ShellCommandSharedMemorySource"),
+                            "The process of an executable UDF (pid {}) exited while it was idle in the pool; "
+                            "it is discarded, with its region, and a replacement is started for this borrow.",
+                            worker->getPid());
+                    else
+                        LOG_WARNING(
+                            getLogger("ShellCommandSharedMemorySource"),
+                            "The process of an executable UDF (pid {}) exited while it was idle in the pool, "
+                            "after writing to its stderr; it is discarded, with its region, and a replacement is "
+                            "started for this borrow. Stderr: {}",
+                            worker->getPid(),
+                            leftover_stderr);
+                });
                 return;
             }
 
             if (TimeoutReadBufferFromFileDescriptor::pipeHasPendingOutput(worker->out.getFD()))
             {
-                const String leftover_stderr = readLeftoverStderrOfExitedProcess(*worker);
-                LOG_WARNING(
-                    getLogger("ShellCommandSharedMemorySource"),
-                    "The process of an executable UDF (pid {}) had unread output on its stdout when it was "
-                    "borrowed, so it wrote after the response of an earlier invocation; it is discarded, with its "
-                    "region, and a replacement is started for this borrow. The command must write nothing but the "
-                    "response frame.{}{}",
-                    worker->getPid(),
-                    leftover_stderr.empty() ? "" : " Stderr: ",
-                    leftover_stderr);
                 ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryDirtyChannelDiscards);
-
-                /// Closed before the process is dropped, so that a worker written to exit on EOF does
-                /// so at once rather than sitting out the termination timeout in the destructor.
-                discardPooledWorkerBeforeTheBorrow(*worker);
+                discardPooledWorkerBeforeTheBorrow(*worker, [&]
+                {
+                    const String leftover_stderr = readLeftoverStderrOfExitedProcess(*worker);
+                    LOG_WARNING(
+                        getLogger("ShellCommandSharedMemorySource"),
+                        "The process of an executable UDF (pid {}) had unread output on its stdout when it was "
+                        "borrowed, so it wrote after the response of an earlier invocation; it is discarded, with its "
+                        "region, and a replacement is started for this borrow. The command must write nothing but the "
+                        "response frame.{}{}",
+                        worker->getPid(),
+                        leftover_stderr.empty() ? "" : " Stderr: ",
+                        leftover_stderr);
+                });
                 return;
             }
 
@@ -2894,40 +2895,39 @@ namespace
             if (!stderr_throws || !TimeoutReadBufferFromFileDescriptor::pipeHasPendingOutput(worker->err.getFD()))
                 return;
 
-            const String leftover_stderr = readLeftoverStderrOfExitedProcess(*worker);
-            LOG_WARNING(
-                getLogger("ShellCommandSharedMemorySource"),
-                "The process of an executable UDF (pid {}) had unread output on its stderr when it was "
-                "borrowed under stderr_reaction 'throw', so it wrote after the response of an earlier invocation "
-                "and may still be writing; it is discarded, with its region, and a replacement is started for "
-                "this borrow. Stderr: {}",
-                worker->getPid(),
-                leftover_stderr);
+            /// A worker blocked writing its stderr does not wait out the termination timeout either:
+            /// the destructor closes the read end of the pipe before it waits, and the blocked
+            /// `write` fails.
             ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryDirtyChannelDiscards);
-
-            /// Closed before the process is dropped, like above. A worker blocked writing its stderr
-            /// does not wait out the termination timeout either: the destructor closes the read end
-            /// of the pipe before it waits, and the blocked `write` fails.
-            discardPooledWorkerBeforeTheBorrow(*worker);
+            discardPooledWorkerBeforeTheBorrow(*worker, [&]
+            {
+                const String leftover_stderr = readLeftoverStderrOfExitedProcess(*worker);
+                LOG_WARNING(
+                    getLogger("ShellCommandSharedMemorySource"),
+                    "The process of an executable UDF (pid {}) had unread output on its stderr when it was "
+                    "borrowed under stderr_reaction 'throw', so it wrote after the response of an earlier invocation "
+                    "and may still be writing; it is discarded, with its region, and a replacement is started for "
+                    "this borrow. Stderr: {}",
+                    worker->getPid(),
+                    leftover_stderr);
+            });
         }
 
-        /// Drops a worker `inspectPooledWorkerBeforeTheBorrow` found unfit, together with its region.
-        /// Its inputs are closed first, so that a process written to exit on EOF does so at once.
-        /// Closing can throw, and can have closed some of the descriptors by then - and the worker
-        /// has to go either way: a holder still holding its process would hand it back to the pool
-        /// when the constructor unwinds, half-closed, for the next borrow to be built on.
-        void discardPooledWorkerBeforeTheBorrow(ShellCommand & worker)
+        /// Drops a worker `inspectPooledWorkerBeforeTheBorrow` found unfit, together with its region,
+        /// after `report` - which reads what the worker left on its pipes and logs it, so it needs the
+        /// worker alive. Its inputs are closed next, so that a process written to exit on EOF does so
+        /// at once rather than sitting out the termination timeout. The decision is already made, and
+        /// the worker has to go whatever happens on the way: both the report (reading, formatting and
+        /// logging allocate - `MEMORY_LIMIT_EXCEEDED`) and closing can throw, and a holder still
+        /// holding the process would hand it back to the pool when the constructor unwinds, for the
+        /// next borrow to be built on the worker that was found unfit. So the discard runs on every
+        /// path, and the exception goes on after it.
+        template <typename Report>
+        void discardPooledWorkerBeforeTheBorrow(ShellCommand & worker, Report && report)
         {
-            try
-            {
-                worker.closeInputs();
-            }
-            catch (...)
-            {
-                command_holder->discardWorkerAndRegion();
-                throw;
-            }
-            command_holder->discardWorkerAndRegion();
+            SCOPE_EXIT({ command_holder->discardWorkerAndRegion(); });
+            report();
+            worker.closeInputs();
         }
 
         /// Charge/uncharge the query memory tracker for the mmap'd shared-memory region.
@@ -3758,10 +3758,11 @@ namespace
                     /// the destructor sends `SIGKILL` to the worker's whole process group and reaps
                     /// the worker (`ShellCommand::Config::own_process_group`): neither the worker nor
                     /// a descendant still in its group runs again, so nothing can write into the
-                    /// region after the charge below is dropped. The region then frees every page
-                    /// of its file as it is destroyed (`~SharedMemoryRegion`). What is out of reach is
-                    /// a descendant that left the group, or one left behind by a worker that had
-                    /// already exited and been reaped (see the note on the cap in
+                    /// region after the charge below is dropped. A worker that exits in time is reaped
+                    /// only after its group is sent `SIGKILL` as well, so descendants it left behind
+                    /// do not outlive it. The region then frees every page of its file as it is
+                    /// destroyed (`~SharedMemoryRegion`). What is out of reach is a descendant that
+                    /// left the group (see the note on the cap in
                     /// `docs/reference/functions/regular-functions/udf.mdx`).
                     command = nullptr;
 
@@ -3994,8 +3995,8 @@ Pipe ShellCommandSourceCoordinator::createPipe(
     /// for the region when it drops the process. A process that outlived its termination signal,
     /// or a descendant that inherited the descriptor, could still write into the region after that
     /// and take pages nobody is charged for. So such a command runs in a process group of its own,
-    /// and dropping it ends the group with `SIGKILL` before the region goes (see
-    /// `ShellCommand::Config::own_process_group`).
+    /// and its group is ended with `SIGKILL` before the region goes - when the command exits, or
+    /// when it is dropped (see `ShellCommand::Config::own_process_group`).
     command_config.own_process_group = configuration.use_shared_memory;
 
     bool is_executable_pool = (process_pool != nullptr);

@@ -8,6 +8,7 @@
 #include <base/scope_guard.h>
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -244,20 +245,56 @@ static PollPidResult pollPid(pid_t /*pid*/, int /*timeout_in_ms*/)
     #error "Unsupported OS type"
 #endif
 
-bool waitForPid(pid_t pid, size_t timeout_in_seconds)
+ChildState peekChildState(pid_t pid, bool blocking)
 {
-    int status = 0;
+#if defined(OS_WASM)
+    (void)pid;
+    (void)blocking;
+    return ChildState::NOT_OUR_CHILD;
+#else
+    siginfo_t info{};
+    int res = HANDLE_EINTR(waitid(P_PID, static_cast<id_t>(pid), &info, WEXITED | WNOWAIT | (blocking ? 0 : WNOHANG)));
+    if (res != 0)
+        return ChildState::NOT_OUR_CHILD;
+    /// With `WNOHANG` and a child that has not exited, `waitid` succeeds and leaves `info` zeroed.
+    /// glibc defines `si_pid` as a macro that names itself, which `-Wdisabled-macro-expansion` reports.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdisabled-macro-expansion"
+    const pid_t exited_pid = info.si_pid;
+#pragma clang diagnostic pop
+    return exited_pid == pid ? ChildState::EXITED : ChildState::RUNNING;
+#endif
+}
 
+/// 1 if `pid` has exited (and, unless `leave_unreaped`, is reaped), 0 if it is running, -1 on error.
+static int checkPidExited(pid_t pid, bool leave_unreaped)
+{
+    if (leave_unreaped)
+    {
+        switch (peekChildState(pid, /*blocking=*/ false))
+        {
+            case ChildState::EXITED: return 1;
+            case ChildState::RUNNING: return 0;
+            case ChildState::NOT_OUR_CHILD: return -1;
+        }
+    }
+
+    int status = 0;
+    int waitpid_res = HANDLE_EINTR(waitpid(pid, &status, WNOHANG));
+    if (waitpid_res == pid)
+        return 1;
+    return waitpid_res == 0 ? 0 : -1;
+}
+
+bool waitForPid(pid_t pid, size_t timeout_in_seconds, bool leave_unreaped)
+{
     Stopwatch watch;
 
     if (timeout_in_seconds == 0)
     {
         /// If there is no timeout before signal try to waitpid 1 time without block so we can avoid sending
         /// signal if process is already normally terminated.
-
-        int waitpid_res = HANDLE_EINTR(waitpid(pid, &status, WNOHANG));
-        bool process_terminated_normally = (waitpid_res == pid);
-        return process_terminated_normally;
+        return checkPidExited(pid, leave_unreaped) == 1;
     }
 
     /// If timeout is positive, poll until the process exits or the total wall
@@ -270,12 +307,11 @@ bool waitForPid(pid_t pid, size_t timeout_in_seconds)
     const Int64 total_timeout_ms = static_cast<Int64>(timeout_in_seconds * 1000);
     while (true)
     {
-        int waitpid_res = HANDLE_EINTR(waitpid(pid, &status, WNOHANG));
-        bool process_terminated_normally = (waitpid_res == pid);
-        if (process_terminated_normally)
+        int exited = checkPidExited(pid, leave_unreaped);
+        if (exited == 1)
             return true;
 
-        if (waitpid_res != 0)
+        if (exited != 0)
             return false;
 
         const Int64 remaining_ms = total_timeout_ms - static_cast<Int64>(watch.elapsedMilliseconds());

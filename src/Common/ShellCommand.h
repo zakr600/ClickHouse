@@ -97,13 +97,16 @@ public:
         bool register_in_udf_process_registry = false;
 
         /// When true, the child is started in a process group of its own (`setpgid(0, 0)` before
-        /// `exec`), and the destructor ends that whole group rather than one process: once the
-        /// wait for a normal exit is over (`terminate_in_destructor_strategy`), every process
-        /// still in the group - the child, or descendants it left behind - is sent `SIGKILL`, and
-        /// the child is reaped. For a child that shares something with the server that the server
-        /// is about to stop accounting for (the region of a shared-memory UDF): after `SIGKILL`
-        /// nothing in the group runs user code again, so nothing can write into it any more. A
-        /// descendant that left the group (`setsid`, `setpgid`) is out of reach.
+        /// `exec`), and the group is ended as a whole rather than one process. Whenever the child
+        /// exits, its group is sent `SIGKILL` before the child is reaped, so descendants it left
+        /// behind die with it; and when the wait for a normal exit in the destructor is over
+        /// (`terminate_in_destructor_strategy`), the whole group, the child included, is sent
+        /// `SIGKILL` in place of `termination_signal`. For a child that shares something with the
+        /// server that the server is about to stop accounting for (the region of a shared-memory
+        /// UDF): after `SIGKILL` nothing in the group runs user code again, so nothing can write
+        /// into it any more. A descendant that left the group (`setsid`, `setpgid`) is out of reach.
+        /// The group is not the server's, so signals sent to the server's group - a terminal's
+        /// Ctrl-C, `kill(0, ...)` - do not reach it; the server ends it on its own teardown.
         bool own_process_group = false;
     };
 
@@ -239,15 +242,21 @@ private:
     bool wait_called = false;
     bool do_not_terminate = false;
 
-    /// Whether the child has actually been reaped. Not the same as `wait_called`, which a bounded
-    /// wait sets before it starts and leaves set when it runs out with the child still alive. As
-    /// long as this is false the child's pid - and the number of the group it leads, with
-    /// `Config::own_process_group` - is still its own and cannot belong to anything else.
+    /// Whether the child has been reaped, or found not to be a child of this process any more
+    /// (`ECHILD`). Not the same as `wait_called`, which a bounded wait sets before it starts and
+    /// leaves set when it runs out with the child still alive. Once this is true, the child's pid -
+    /// and the number of the group it leads, with `Config::own_process_group` - may belong to
+    /// somebody else, so it is neither signalled nor waited for.
     bool child_reaped = false;
 
     /// Sends `SIGKILL` to the child's process group and reaps the child (`Config::own_process_group`).
-    /// Only while the child is not reaped: after that the number may already name somebody else.
+    /// Only while the child is still an unreaped child of this process: otherwise the number may
+    /// already name somebody else.
     void killProcessGroupAndReapNoThrow() noexcept;
+
+    /// Sends `SIGKILL` to the process group of a child that has exited and is not reaped yet
+    /// (`Config::own_process_group`), so that what it left behind in its group dies with it.
+    void killGroupOfExitedChild();
 
     /// CPU time of the reaped child, taken from `wait4` rusage and stored by value
     /// at reap time. The reap path performs no allocation, so a memory-limit

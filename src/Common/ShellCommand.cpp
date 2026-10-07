@@ -148,8 +148,8 @@ ShellCommand::~ShellCommand()
         return;
 
     /// A group of its own is ended as a whole, whatever happened before: a bounded wait that ran
-    /// out (`wait_called` is set, the child alive), or the normal exit wait below running out. Not
-    /// once the child has been reaped - see `killProcessGroupAndReapNoThrow`.
+    /// out (`wait_called` is set, the child alive), or the normal exit wait below running out. A
+    /// child that exited was reaped only after its group got `SIGKILL` (`killGroupOfExitedChild`).
     SCOPE_EXIT({
         if (config.own_process_group)
             killProcessGroupAndReapNoThrow();
@@ -210,6 +210,16 @@ bool ShellCommand::tryWaitProcessWithTimeout(size_t timeout_in_seconds)
     for (auto & [_, fd] : read_fds)
         fd.close();
 
+    if (config.own_process_group)
+    {
+        /// The exited child stays a zombie until its group has been killed, which keeps the
+        /// number of the group from being reused in between.
+        if (!waitForPid(pid, timeout_in_seconds, /*leave_unreaped=*/ true))
+            return false;
+        killProcessGroupAndReapNoThrow();
+        return child_reaped;
+    }
+
     bool process_terminated_normally = waitForPid(pid, timeout_in_seconds);
     if (process_terminated_normally)
         child_reaped = true;
@@ -220,6 +230,13 @@ bool ShellCommand::tryWaitProcessWithTimeout(size_t timeout_in_seconds)
     return process_terminated_normally;
 }
 
+void ShellCommand::killGroupOfExitedChild()
+{
+    /// The child is a zombie that nobody has reaped, so the number of its group is still its own.
+    if (0 != ::kill(-pid, SIGKILL) && errno != ESRCH)
+        LOG_WARNING(getLogger(), "Cannot kill the process group of shell command pid {}, error: '{}'", pid, errnoToString());
+}
+
 void ShellCommand::killProcessGroupAndReapNoThrow() noexcept
 {
     if (child_reaped)
@@ -227,8 +244,17 @@ void ShellCommand::killProcessGroupAndReapNoThrow() noexcept
 
     try
     {
-        /// The child is not reaped, so its pid - which is the number of the group it leads - is
-        /// still its own: a signal to `-pid` reaches this group and nothing else.
+        /// `child_reaped` can be false for a pid that is not ours any more: a `waitpid` that failed
+        /// says nothing about the child, and somebody else may have reaped it. Only a child that
+        /// `waitid` still finds, alive or a zombie, keeps its pid - which is the number of the
+        /// group it leads - to itself, so that a signal to `-pid` reaches this group and nothing else.
+        if (peekChildState(pid, /*blocking=*/ false) == ChildState::NOT_OUR_CHILD)
+        {
+            child_reaped = true;
+            LOG_WARNING(getLogger(), "Shell command pid {} is no longer a child of this process; its process group is not signalled", pid);
+            return;
+        }
+
         if (0 != ::kill(-pid, SIGKILL) && errno != ESRCH)
             LOG_WARNING(getLogger(), "Cannot kill the process group of shell command pid {}, error: '{}'", pid, errnoToString());
 
@@ -686,6 +712,25 @@ ShellCommand::tryWaitResult ShellCommand::tryWaitImpl(bool blocking, bool check_
     int waitpid_retcode = -1;
     ::rusage local_rusage{};
 
+    if (config.own_process_group)
+    {
+        /// Wait for the exit without reaping, and kill the group before the reap: once the child
+        /// is reaped, the number of its group may belong to somebody else, and the descendants it
+        /// left behind in it would be out of reach.
+        const ChildState state = peekChildState(pid, blocking);
+        if (state == ChildState::RUNNING)
+        {
+            result.is_process_terminated = false;
+            return result;
+        }
+        if (state == ChildState::NOT_OUR_CHILD)
+        {
+            child_reaped = true;
+            throw ErrnoException(ErrorCodes::CANNOT_WAITPID, "Cannot waitid");
+        }
+        killGroupOfExitedChild();
+    }
+
     while (waitpid_retcode < 0)
     {
         /// Reap the child. With `Config::collect_resource_usage` (executable UDFs),
@@ -721,7 +766,13 @@ ShellCommand::tryWaitResult ShellCommand::tryWaitImpl(bool blocking, bool check_
             return result;
         }
         if (errno != EINTR)
+        {
+            /// Not a child of this process any more: its pid may be reused, so it must not be
+            /// signalled or waited for again.
+            if (errno == ECHILD)
+                child_reaped = true;
             throw ErrnoException(ErrorCodes::CANNOT_WAITPID, "Cannot waitpid");
+        }
     }
 
     LOG_TRACE(getLogger(), "Wait for shell command pid {} completed with status {}", pid, status);
