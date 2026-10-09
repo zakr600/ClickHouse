@@ -1146,13 +1146,12 @@ bool ShellCommand::waitDrainingOutput(
 
         if (drain_fds[0] < 0 && drain_fds[1] < 0)
         {
-            /// Nothing left to drain, only a child that has not exited yet. Block on its exit when
-            /// no timeout or cancellation needs checking; otherwise poll with a timeout so the
-            /// outer loop can check both without spinning.
-            if (unbounded && !check_cancelled)
-                peekChildState(pid, /*blocking=*/ true);
-            else if (::poll(nullptr, 0, static_cast<int>(step_ms)) < 0 && errno != EINTR)
-                throw ErrnoException(ErrorCodes::CANNOT_WAITPID, "Cannot poll while waiting for shell command pid {}", pid);
+            /// Nothing left to drain, only a child that has not exited yet. Wait for its exit
+            /// itself (`pidfd`), left unreaped for the `waitpid` above to collect, and come back at
+            /// least every `exit_wait_step_ms` to check for cancellation and the budget: there is
+            /// nothing on the pipes to come back for sooner.
+            static constexpr UInt64 exit_wait_step_ms = 100;
+            waitForPidMilliseconds(pid, unbounded ? exit_wait_step_ms : std::min(remaining_ms, exit_wait_step_ms), /*leave_unreaped=*/ true);
             continue;
         }
 

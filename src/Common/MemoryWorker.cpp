@@ -882,6 +882,9 @@ void MemoryWorker::updateResidentMemoryThread()
             /// combined footprint to exceed the server limit when tracker correction is disabled
             /// or sanitizer overhead makes RSS larger than the allocated counter.
             const Int64 unmeasured = CurrentMetrics::get(CurrentMetrics::MemoryTrackingUnmeasured);
+            /// Except for the purge decision below: a purge returns jemalloc's dirty pages, and the
+            /// shared-memory pages are not jemalloc's to return.
+            [[maybe_unused]] const Int64 allocator_resident = memory_usage.resident;
             memory_usage.resident += unmeasured;
             memory_usage.allocated += unmeasured;
 
@@ -961,7 +964,7 @@ void MemoryWorker::updateResidentMemoryThread()
             const auto purge_dirty_pages_threshold = static_cast<double>(memory_tracker_limit) * purge_dirty_pages_threshold_ratio;
 
             const bool needs_purge
-                = (purge_total_memory_threshold_ratio > 0 && static_cast<double>(memory_usage.resident) > purge_total_memory_threshold)
+                = (purge_total_memory_threshold_ratio > 0 && static_cast<double>(allocator_resident) > purge_total_memory_threshold)
                 || (purge_dirty_pages_threshold_ratio > 0
                     && static_cast<double>(pdirty_mib.getValue() * page_size) > purge_dirty_pages_threshold);
 

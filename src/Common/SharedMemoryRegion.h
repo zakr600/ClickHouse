@@ -106,6 +106,23 @@ public:
       */
     void grow(size_t new_size);
 
+    /** The two halves of clearing the file up to its length without writing to it.
+      *
+      * `releasePagesUpToLength` frees the pages from the start of the file to the end of the page
+      * its length ends in (`FALLOC_FL_PUNCH_HOLE`, which the seals allow); from then on they read
+      * as zeros, through every mapping. It returns the pages the file still holds: the ones past
+      * that range, which only the command can have committed. That is the one figure the cost of
+      * the second half cannot be known without - `recommitUpToLength` commits the pages up to the
+      * length again (`posix_fallocate`), so the file then holds exactly those pages plus the length,
+      * rounded up to pages - and the caller charges for it in between.
+      *
+      * The pages are committed again rather than left out, because a page left out is allocated on
+      * the next write, on the hot path. Between the two halves the region is already clear, and a
+      * failure of the second leaves it so, only with its pages to be allocated on use.
+      */
+    size_t releasePagesUpToLength();
+    void recommitUpToLength();
+
     char * data() { return region_data; }
     const char * data() const { return region_data; }
 

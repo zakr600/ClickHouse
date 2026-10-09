@@ -2903,7 +2903,7 @@ namespace
 
             if (pooledProcessHasExitedCleanly(*worker))
             {
-                discardPooledWorkerBeforeTheBorrow(*worker, [&]
+                discardPooledWorkerBeforeTheBorrow([&]
                 {
                     /// Whatever it said on its way out is read and reported now, before the process
                     /// is dropped with its pipes: nobody else will ever read it.
@@ -2929,7 +2929,7 @@ namespace
             if (TimeoutReadBufferFromFileDescriptor::pipeHasPendingOutput(worker->out.getFD()))
             {
                 ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryDirtyChannelDiscards);
-                discardPooledWorkerBeforeTheBorrow(*worker, [&]
+                discardPooledWorkerBeforeTheBorrow([&]
                 {
                     const String leftover_stderr = readLeftoverStderrOfExitedProcess(*worker);
                     LOG_WARNING(
@@ -2961,7 +2961,7 @@ namespace
             /// the destructor closes the read end of the pipe before it waits, and the blocked
             /// `write` fails.
             ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryDirtyChannelDiscards);
-            discardPooledWorkerBeforeTheBorrow(*worker, [&]
+            discardPooledWorkerBeforeTheBorrow([&]
             {
                 const String leftover_stderr = readLeftoverStderrOfExitedProcess(*worker);
                 LOG_WARNING(
@@ -2977,19 +2977,18 @@ namespace
 
         /// Drops a worker `inspectPooledWorkerBeforeTheBorrow` found unfit, together with its region,
         /// after `report` - which reads what the worker left on its pipes and logs it, so it needs the
-        /// worker alive. Its inputs are closed next, so that a process written to exit on EOF does so
-        /// at once rather than sitting out the termination timeout. The decision is already made, and
-        /// the worker has to go whatever happens on the way: both the report (reading, formatting and
-        /// logging allocate - `MEMORY_LIMIT_EXCEEDED`) and closing can throw, and a holder still
-        /// holding the process would hand it back to the pool when the constructor unwinds, for the
-        /// next borrow to be built on the worker that was found unfit. So the discard runs on every
-        /// path, and the exception goes on after it.
+        /// worker alive. (`~ShellCommand` closes the worker's inputs before it waits for it, so a
+        /// process written to exit on EOF does so at once.) The decision is already made, and the
+        /// worker has to go whatever happens on the way: the report can throw (reading, formatting
+        /// and logging allocate - `MEMORY_LIMIT_EXCEEDED`), and a holder still holding the process
+        /// would hand it back to the pool when the constructor unwinds, for the next borrow to be
+        /// built on the worker that was found unfit. So the discard runs on every path, and the
+        /// exception goes on after it.
         template <typename Report>
-        void discardPooledWorkerBeforeTheBorrow(ShellCommand & worker, Report && report)
+        void discardPooledWorkerBeforeTheBorrow(Report && report)
         {
             SCOPE_EXIT({ command_holder->discardWorkerAndRegion(); });
             report();
-            worker.closeInputs();
         }
 
         /// Charge/uncharge the query memory tracker for the mmap'd shared-memory region.
@@ -3325,47 +3324,55 @@ namespace
         /// under different roles, than the previous one (`ShellCommandHolder::BorrowerIdentity`).
         /// What a query wrote into a pooled region stays there until overwritten, and the command
         /// serving the next query can read it - over the pipes it only ever saw what it was sent.
-        /// That boundary is where it matters, and the cost is paid only there: a `memset` of the
-        /// region, nothing when the borrower is the same. The whole region and not just
-        /// what the server knows it used: the command may have written anywhere in it, and only
-        /// zeroing everything says anything about all of it - and by now the whole file is mapped
-        /// (`takeOverReusedRegion`), so the region is the file. Zeroed rather than freed: a freed
-        /// page would come back on the next write, at the cost of an allocation on the hot path.
+        /// That boundary is where it matters, and the cost is paid only there: nothing when the
+        /// borrower is the same. The whole file and not just what the server knows it used: the
+        /// command may have written anywhere in it, and only clearing everything says anything
+        /// about all of it - and by now the whole file is mapped (`takeOverReusedRegion`), so the
+        /// region is the file.
+        ///
+        /// Cleared by freeing its pages and committing them again
+        /// (`SharedMemoryRegion::releasePagesUpToLength`) rather than by writing zeros over them,
+        /// because only that tells what the clearing costs before it commits anything. A write
+        /// allocates every page the command freed under the length, and the footprint the borrow
+        /// is charged for cannot see such holes when the command committed as many pages past the
+        /// end (`SharedMemoryRegion::fillCostUpTo`): the charge before a write would have to be
+        /// the whole region on top of the one the borrow already has, and a query that fits the
+        /// region once would be refused for a borrow that commits nothing new. With the pages
+        /// freed first, what is left is exactly what the command committed past the end, and the
+        /// commit adds the length to it.
         void scrubRegionForBorrower()
         {
             ShellCommandHolder::BorrowerIdentity borrower{context->getUserID(), context->getCurrentRoles()};
             /// A region this borrow created is a fresh, zero-filled file with nobody's data in it:
             /// the discarded worker's region went with it (`resetSharedMemory` in `cleanup`), and
-            /// zeroing a new one would be a wasted write of its size.
+            /// clearing a new one would be wasted work of its size.
             if (command_holder->lastBorrower() && *command_holder->lastBorrower() != borrower
                 && shared_memory_region && !region_created_by_this_borrow)
             {
                 auto & region = *shared_memory_region;
 
-                /// The scrub writes every page of the mapping, and a page the command freed under the
-                /// file's length is allocated again by that write. The footprint the borrow was charged
-                /// for cannot see such holes when the command committed as many pages past the end of
-                /// the file (`SharedMemoryRegion::fillCostUpTo`), so the query is charged for the worst
-                /// case - every page of the mapping missing - before the write, like a growth
-                /// (`ensureRegionFits`), and the charge is settled against the footprint re-read after
-                /// it. A refill that took the footprint past the cap is a region the command made over
-                /// the cap: the borrow fails closed, with the worker and its region. May throw the
-                /// memory limit before anything is written, and then the region is left as it was,
-                /// still recorded as the previous borrower's.
+                /// The region is clear from here on, whatever happens below. The charge is brought
+                /// up to what the commit makes the file hold - may throw the memory limit, and then
+                /// the pages are left to be allocated on use, and the region is still recorded as
+                /// the previous borrower's, to be cleared again by the next borrow of a different
+                /// one. The charge is settled against the footprint re-read after the commit, and
+                /// a commit that took the footprint past the cap is a region the command made over
+                /// the cap: the borrow fails closed, with the worker and its region.
                 const size_t charged_before = query_memory_charge;
-                const size_t worst_case = SharedMemoryRegion::roundUpToPages(region.size());
-                chargeQueryMemory(worst_case);
+                const size_t past_the_length = region.releasePagesUpToLength();
+                const size_t charged = std::max(charged_before, SharedMemoryRegion::roundUpToPages(region.backingSize()) + past_the_length);
+                if (charged > charged_before)
+                    chargeQueryMemory(charged - charged_before);
 
-                memset(region.data(), 0, region.size());
+                region.recommitUpToLength();
                 ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryScrubbedBytes, region.size());
 
-                const size_t charged = charged_before + worst_case;
                 const size_t footprint_after = region.refreshFootprint();
                 if (region.isOverTheCap(shared_memory_max_size))
                     failBorrowOnRegionOverTheCap(std::max(region.backingSize(), region.costOnceMappedWhole()));
 
                 /// Never below what the borrow was charged before the scrub: that charge was made
-                /// for the region as it was handed over, and the scrub does not free anything.
+                /// for the region as it was handed over.
                 const size_t settled = std::max(charged_before, footprint_after);
                 if (settled < charged)
                     unchargeQueryMemory(charged - settled);
@@ -4186,9 +4193,7 @@ Pipe ShellCommandSourceCoordinator::createPipe(
         /// provably not its answer; this transport has no framing that would let the query tell
         /// them from its own rows once it has started reading, which is exactly why they must not
         /// be there when it does. Seen here they cost the worker, not the query: it is dropped for
-        /// a fresh one, as on the shared-memory path. Its stdin is closed first, so that a worker
-        /// written to exit on EOF does so at once rather than sitting out the termination timeout.
-        /// A byte that lands between this look and the first request is the one case left, and
+        /// a fresh one, as on the shared-memory path. A byte that lands between this look and the first request is the one case left, and
         /// `quarantineReusedWorker` fails the query for it rather than answer it wrongly.
         if (worker_is_reused && TimeoutReadBufferFromFileDescriptor::pipeHasPendingOutput(process->out.getFD()))
         {
@@ -4202,7 +4207,6 @@ Pipe ShellCommandSourceCoordinator::createPipe(
                 leftover_stderr.empty() ? "" : " Stderr: ",
                 leftover_stderr);
 
-            process->closeInputs();
             process.reset();
             process = process_holder->buildCommand();
             worker_is_reused = false;
@@ -4227,7 +4231,6 @@ Pipe ShellCommandSourceCoordinator::createPipe(
                 process->getPid(),
                 leftover_stderr);
 
-            process->closeInputs();
             process.reset();
             process = process_holder->buildCommand();
             worker_is_reused = false;

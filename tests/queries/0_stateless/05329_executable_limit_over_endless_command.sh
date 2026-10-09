@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Tags: no-msan
-# - no-msan: Memory Sanitizer cannot work with vfork, which starts the command
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh

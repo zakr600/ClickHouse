@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-msan, no-darwin
-# - no-msan: Memory Sanitizer cannot work with vfork, which starts the command
+# Tags: no-darwin
 # - no-darwin: the commands are waited for through `/proc`
 
 # What a pooled command of the pipe transport writes besides its rows, and when: with them, after them,

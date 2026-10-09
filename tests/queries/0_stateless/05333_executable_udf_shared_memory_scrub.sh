@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-msan, no-darwin
-# - no-msan: Memory Sanitizer cannot work with vfork, which starts the command
+# Tags: no-darwin
 # - no-darwin: shared-memory regions for executable UDFs are supported only on Linux
 
 # A pooled region keeps what the last request left in it, and the pool serves everybody: over the

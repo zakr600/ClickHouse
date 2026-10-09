@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-msan, no-darwin
-# - no-msan: Memory Sanitizer cannot work with vfork, which starts the command
+# Tags: no-darwin
 # - no-darwin: the commands are waited for through `/proc`
 
 # The worker answers, closes its stdout and waits for both of its inputs to reach EOF. A hung-up

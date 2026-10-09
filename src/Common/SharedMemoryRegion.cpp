@@ -205,6 +205,35 @@ void SharedMemoryRegion::checkSupported()
             "Shared-memory regions for executable UDFs need file sealing, which this system does not provide");
     }
 
+    /// A region's pages are freed with `FALLOC_FL_PUNCH_HOLE` when the server drops it - at the
+    /// moment its charge is dropped (`releasePagesNoThrow`) - and when it is cleared for another
+    /// borrower (`releasePagesUpToLength`). A system that allows `posix_fallocate` but not the hole
+    /// punch would load the function and then keep pages nobody is charged for, so ask here, under
+    /// the seals the region has, and check by the pages the file holds afterwards that the pages
+    /// are really gone: a filter can answer success without doing anything.
+    const off_t page_size = static_cast<off_t>(::sysconf(_SC_PAGESIZE));
+    const off_t whole_file = std::numeric_limits<off_t>::max() / page_size * page_size;
+    if (0 != ::fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, whole_file))
+    {
+        const int saved_errno = errno;
+        ErrnoException::throwWithErrno(
+            ErrorCodes::NOT_IMPLEMENTED,
+            saved_errno,
+            "Shared-memory regions for executable UDFs need fallocate with FALLOC_FL_PUNCH_HOLE on a memfd, which this system refuses");
+    }
+
+    struct stat punched_stat{};
+    if (0 != ::fstat(fd, &punched_stat))
+    {
+        const int saved_errno = errno;
+        ErrnoException::throwWithErrno(ErrorCodes::NOT_IMPLEMENTED, saved_errno, "Cannot fstat the shared-memory region probe");
+    }
+    if (punched_stat.st_blocks != 0)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Shared-memory regions for executable UDFs need fallocate with FALLOC_FL_PUNCH_HOLE to free the pages of a memfd, "
+            "and on this system it does not: {} bytes are still held after it",
+            static_cast<size_t>(punched_stat.st_blocks) * 512);
+
     /// The command reaches its region by opening `/proc/self/fd/N`, so a system without `procfs`
     /// (a bare `chroot`, a container without it mounted) would load the function and then fail
     /// every call. Ask here instead, the way the command will: open the probe through its own
@@ -339,6 +368,30 @@ void SharedMemoryRegion::grow(size_t new_size)
     region_size = new_size;
 }
 
+size_t SharedMemoryRegion::releasePagesUpToLength()
+{
+    const size_t length = refreshBackingSize();
+    const off_t range = static_cast<off_t>(roundUpToPages(length));
+    if (0 != ::fallocate(region_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, range))
+    {
+        const int saved_errno = errno;
+        ErrnoException::throwWithErrno(
+            ErrorCodes::CANNOT_ALLOCATE_MEMORY, saved_errno, "SharedMemoryRegion: Cannot free the pages of the region up to {}",
+            ReadableSize(length));
+    }
+
+    /// Read back rather than assumed to be zero: the pages past the range are the command's, and
+    /// nothing else says how many there are.
+    refreshFootprint();
+    return committed_size;
+}
+
+void SharedMemoryRegion::recommitUpToLength()
+{
+    reserveBackingStorage(region_fd, backing_size, "recommit");
+    reserved_size = std::max(reserved_size, backing_size);
+}
+
 size_t SharedMemoryRegion::refreshBackingSize()
 {
     struct stat st{};
@@ -462,6 +515,17 @@ SharedMemoryRegion::SharedMemoryRegion(size_t)
 }
 
 void SharedMemoryRegion::grow(size_t)
+{
+    checkSupported();
+}
+
+size_t SharedMemoryRegion::releasePagesUpToLength()
+{
+    checkSupported();
+    return 0;
+}
+
+void SharedMemoryRegion::recommitUpToLength()
 {
     checkSupported();
 }

@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Tags: no-msan
-# - no-msan: Memory Sanitizer cannot work with vfork, which starts the command
 
 # How the pipe transport waits for a command once its output has ended: for its exit status under
 # `check_exit_code`, for its last words on stderr, and how long - `command_termination_timeout` bounds

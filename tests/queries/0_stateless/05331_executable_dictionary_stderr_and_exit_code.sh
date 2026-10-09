@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-msan, no-darwin
-# - no-msan: Memory Sanitizer cannot work with vfork, which starts the command
+# Tags: no-darwin
 # - no-darwin: the commands are waited for through `/proc`
 
 # `stderr_reaction`, `check_exit_code` and the `command_termination_timeout` budget for a command that

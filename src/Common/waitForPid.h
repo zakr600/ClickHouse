@@ -11,6 +11,9 @@ namespace DB
  */
 bool waitForPid(pid_t pid, size_t timeout_in_seconds, bool leave_unreaped = false);
 
+/// The same, with the timeout in milliseconds.
+bool waitForPidMilliseconds(pid_t pid, size_t timeout_in_milliseconds, bool leave_unreaped = false);
+
 enum class ChildState
 {
     RUNNING,

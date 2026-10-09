@@ -116,6 +116,16 @@ static PollPidResult pollPid(pid_t pid, int timeout_in_ms)
 
             return PollPidResult::FAILED;
         }
+
+        /// A `/proc/<pid>` directory is always ready for `poll`, so polling it waits for nothing,
+        /// and the caller would spin until the process exits. Without a `pidfd` there is nothing
+        /// to wait on: wait a short step instead, and let the caller look again.
+        [[maybe_unused]] int err = close(pid_fd);
+        chassert(!err || errno == EINTR);
+
+        static constexpr int proc_step_ms = 5;
+        poll(nullptr, 0, std::min(timeout_in_ms, proc_step_ms));
+        return PollPidResult::RESTART;
     }
 
     /// Releases pid_fd on every return path, including poll timeout and error.
@@ -288,9 +298,14 @@ static int checkPidExited(pid_t pid, bool leave_unreaped)
 
 bool waitForPid(pid_t pid, size_t timeout_in_seconds, bool leave_unreaped)
 {
+    return waitForPidMilliseconds(pid, timeout_in_seconds * 1000, leave_unreaped);
+}
+
+bool waitForPidMilliseconds(pid_t pid, size_t timeout_in_milliseconds, bool leave_unreaped)
+{
     Stopwatch watch;
 
-    if (timeout_in_seconds == 0)
+    if (timeout_in_milliseconds == 0)
     {
         /// If there is no timeout before signal try to waitpid 1 time without block so we can avoid sending
         /// signal if process is already normally terminated.
@@ -304,7 +319,7 @@ bool waitForPid(pid_t pid, size_t timeout_in_seconds, bool leave_unreaped)
     /// ready, causing `pollPid` to return in ~0 ms — still subtracts real
     /// elapsed time and cannot busy-spin until the child exits on its own.
 
-    const Int64 total_timeout_ms = static_cast<Int64>(timeout_in_seconds * 1000);
+    const Int64 total_timeout_ms = static_cast<Int64>(timeout_in_milliseconds);
     while (true)
     {
         int exited = checkPidExited(pid, leave_unreaped);
