@@ -222,12 +222,17 @@ bool ShellCommand::tryWaitProcessWithTimeout(size_t timeout_in_seconds)
 
     bool process_terminated_normally = waitForPid(pid, timeout_in_seconds);
     if (process_terminated_normally)
-        child_reaped = true;
-
-    if (process_terminated_normally && config.register_in_udf_process_registry)
-        UDFProcessRegistry::instance().removeIfGenerationMatches(pid, udf_registry_generation);
+        forgetChild();
 
     return process_terminated_normally;
+}
+
+void ShellCommand::forgetChild()
+{
+    child_reaped = true;
+    wait_called = true;
+    if (config.register_in_udf_process_registry)
+        UDFProcessRegistry::instance().removeIfGenerationMatches(pid, udf_registry_generation);
 }
 
 void ShellCommand::killGroupOfExitedChild()
@@ -250,7 +255,7 @@ void ShellCommand::killProcessGroupAndReapNoThrow() noexcept
         /// group it leads - to itself, so that a signal to `-pid` reaches this group and nothing else.
         if (peekChildState(pid, /*blocking=*/ false) == ChildState::NOT_OUR_CHILD)
         {
-            child_reaped = true;
+            forgetChild();
             LOG_WARNING(getLogger(), "Shell command pid {} is no longer a child of this process; its process group is not signalled", pid);
             return;
         }
@@ -263,11 +268,7 @@ void ShellCommand::killProcessGroupAndReapNoThrow() noexcept
         static constexpr size_t reap_after_kill_timeout_seconds = 5;
         wait_called = true;
         if (waitForPid(pid, reap_after_kill_timeout_seconds))
-        {
-            child_reaped = true;
-            if (config.register_in_udf_process_registry)
-                UDFProcessRegistry::instance().removeIfGenerationMatches(pid, udf_registry_generation);
-        }
+            forgetChild();
         else
             LOG_WARNING(getLogger(), "Shell command pid {} was not reaped within {} seconds after SIGKILL", pid, reap_after_kill_timeout_seconds);
     }
@@ -726,7 +727,9 @@ ShellCommand::tryWaitResult ShellCommand::tryWaitImpl(bool blocking, bool check_
         }
         if (state == ChildState::NOT_OUR_CHILD)
         {
-            child_reaped = true;
+            const int saved_errno = errno;
+            forgetChild();
+            errno = saved_errno;
             throw ErrnoException(ErrorCodes::CANNOT_WAITPID, "Cannot waitid");
         }
         killGroupOfExitedChild();
@@ -747,10 +750,7 @@ ShellCommand::tryWaitResult ShellCommand::tryWaitImpl(bool blocking, bool check_
             /// A reaped pid may be reused immediately, so `wait_called` must be set the
             /// moment the child is reaped — before any operation that can throw — so the
             /// destructor never waits on or signals an unrelated process.
-            wait_called = true;
-            child_reaped = true;
-            if (config.register_in_udf_process_registry)
-                UDFProcessRegistry::instance().removeIfGenerationMatches(pid, udf_registry_generation);
+            forgetChild();
             if (config.collect_resource_usage)
             {
                 child_user_time_us = static_cast<UInt64>(local_rusage.ru_utime.tv_sec) * 1000000ULL
@@ -771,7 +771,11 @@ ShellCommand::tryWaitResult ShellCommand::tryWaitImpl(bool blocking, bool check_
             /// Not a child of this process any more: its pid may be reused, so it must not be
             /// signalled or waited for again.
             if (errno == ECHILD)
-                child_reaped = true;
+            {
+                const int saved_errno = errno;
+                forgetChild();
+                errno = saved_errno;
+            }
             throw ErrnoException(ErrorCodes::CANNOT_WAITPID, "Cannot waitpid");
         }
     }
@@ -934,7 +938,8 @@ void ShellCommand::drainOutputPipes(
     UInt64 budget_ms,
     bool budget_is_quiet_time,
     UInt64 max_total_ms,
-    size_t * stdout_bytes_drained) const
+    size_t * stdout_bytes_drained,
+    const std::function<void()> & check_cancelled) const
 {
     static constexpr UInt64 poll_step_ms = 5;
     char discard_buffer[4096];
@@ -945,6 +950,9 @@ void ShellCommand::drainOutputPipes(
 
     while (drain_fds[0] >= 0 || drain_fds[1] >= 0)
     {
+        if (check_cancelled)
+            check_cancelled();
+
         const UInt64 now_ns = clock_gettime_ns();
         if (now_ns >= deadline_ns || now_ns >= hard_deadline_ns)
             return;
@@ -1078,7 +1086,14 @@ bool ShellCommand::waitDrainingOutput(
             }
         }
 
-        if ((!check_exit_status || limit_stdout_drain) && drain_fds[0] >= 0 && stdout_bytes_drained > stray_stdout_limit)
+        /// An abandoned output is also closed once `command_termination_timeout` has passed,
+        /// however little arrived: a producer that writes slowly would otherwise take hours to
+        /// reach the limit, and keep the query waiting for all of them. A command that is still
+        /// writing then dies on its next write; one that has stopped writing and only takes its
+        /// time to exit does not notice, and is waited for as long as it takes.
+        const bool stdout_abandoned_for_good = (!check_exit_status || limit_stdout_drain)
+            && (stdout_bytes_drained > stray_stdout_limit || (limit_stdout_drain && remainingTerminationTimeoutMs() == 0));
+        if (stdout_abandoned_for_good && drain_fds[0] >= 0)
         {
             out.close();
             drain_fds[0] = -1;
@@ -1111,7 +1126,21 @@ bool ShellCommand::waitDrainingOutput(
             readBufferedOutput(drain_fds, stderr_sink);
             static constexpr UInt64 post_reap_quiet_ms = 100;
             static constexpr UInt64 post_reap_max_total_ms = 10000;
-            drainOutputPipes(drain_fds, stderr_sink, post_reap_quiet_ms, /*budget_is_quiet_time=*/ true, post_reap_max_total_ms);
+            /// A killed query does not sit this out: the child is reaped, and what is left is only
+            /// what a grandchild may still write. Its exit status and last words go unreported
+            /// then - the query is not waiting for a verdict any more - but the pipes are closed
+            /// all the same, rather than left open until the destructor.
+            try
+            {
+                drainOutputPipes(
+                    drain_fds, stderr_sink, post_reap_quiet_ms, /*budget_is_quiet_time=*/ true, post_reap_max_total_ms,
+                    /*stdout_bytes_drained=*/ nullptr, check_cancelled);
+            }
+            catch (...)
+            {
+                closeStreams();
+                throw;
+            }
             closeStreams();
 
             if (check_exit_status)

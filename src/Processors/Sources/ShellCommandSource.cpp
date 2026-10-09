@@ -893,6 +893,16 @@ static String readLeftoverStderrOfExitedProcess(const ShellCommand & process)
     return result;
 }
 
+/// For `ShellCommand::waitDrainingOutput`: interrupts the wait for a command once its query is killed.
+static std::function<void()> queryKilledCheck(const ContextPtr & context)
+{
+    return [query_status = context->getProcessListElement()]
+    {
+        if (query_status)
+            query_status->throwIfKilled();
+    };
+}
+
 static bool pooledProcessHasExitedCleanly(const ShellCommand & process)
 {
     pollfd pfd{};
@@ -1645,8 +1655,8 @@ namespace
                         /// and `wait` reaps before it closes anything, so it would never return.
                         /// Draining lets the command reach its own exit.
                         ///
-                        /// With `check_exit_code` a non-pooled command whose output completed is
-                        /// waited for without a bound, as the blocking `wait` this replaces did: a command whose cleanup
+                        /// With `check_exit_code` a non-pooled command is waited for without a bound,
+                        /// as the blocking `wait` this replaces did: a command whose cleanup
                         /// outlasts `command_termination_timeout` and then exits successfully passes,
                         /// as it always has. A pooled worker being discarded was never waited for, and
                         /// it gets `command_termination_timeout` and no more; one that does not exit
@@ -1663,23 +1673,25 @@ namespace
                         /// waits draw from one deadline (`remainingTerminationTimeoutMs`), so the
                         /// budget is spent once, here instead of there.
                         /// A downstream `LIMIT` can finish the port before the source reaches EOF.
-                        /// Do not keep an endless producer alive by draining it indefinitely.
+                        /// A producer that goes on writing is not kept alive by draining it: its
+                        /// stdout is closed after a limited amount of extra output, or once
+                        /// `command_termination_timeout` has passed, and it dies on `SIGPIPE`. The wait
+                        /// for its exit stays unbounded all the same, so a command that has stopped
+                        /// writing and takes its time to exit passes, as it does when it is read to
+                        /// the end. A command that neither writes nor exits is waited for until the
+                        /// query is killed - as the blocking `wait` did, which could not be killed.
                         const bool output_abandoned = !finished
                             && (!configuration.read_fixed_number_of_rows || current_read_rows < configuration.number_of_rows_to_read);
                         const bool reaped = command->waitDrainingOutput(
                             [this](std::string_view str) { timeout_command_out.consumeStderrBytes(str); },
                             check_exit_code,
-                            /*unbounded_status_wait=*/ !process_pool && !output_abandoned,
+                            /*unbounded_status_wait=*/ !process_pool,
                             /*limit_stdout_drain=*/ output_abandoned,
-                            [query_status = context->getProcessListElement()]
-                            {
-                                if (query_status)
-                                    query_status->throwIfKilled();
-                            });
+                            queryKilledCheck(context));
 
                         /// A status that could not be read is not a passing status, and that holds
-                        /// however little time the command was given. Pooled workers and commands whose
-                        /// output was abandoned are waited for within a bound. Waving one through with
+                        /// however little time the command was given. Pooled workers are waited for
+                        /// within a bound. Waving one through with
                         /// a warning would make `check_exit_code` mean "checked, unless the timeout is
                         /// short", which is not a contract anyone can rely on.
                         if (!reaped && check_exit_code)
@@ -1768,11 +1780,7 @@ namespace
                     /*check_exit_status=*/ true,
                     /*unbounded_status_wait=*/ false,
                     /*limit_stdout_drain=*/ false,
-                    [query_status = context->getProcessListElement()]
-                    {
-                        if (query_status)
-                            query_status->throwIfKilled();
-                    });
+                    queryKilledCheck(context));
 
                 /// The same rule as the wait in `prepare` that discards a worker: a status that could
                 /// not be read within `command_termination_timeout` is not a passing status. A worker
@@ -2573,6 +2581,11 @@ namespace
                         /// its way out; that spends the budget `~ShellCommand` would otherwise
                         /// spend before signalling it, not a second one (the two waits share one
                         /// deadline), so nothing is stalled that was not stalled before.
+                        /// A worker whose answer was abandoned mid-protocol (a downstream `LIMIT`) is
+                        /// waited for within `command_termination_timeout`: a command written for this
+                        /// transport exits on stdin EOF, and its stdout carries only control frames,
+                        /// so closing it after some amount of output - what ends an abandoned producer
+                        /// on the pipe path - would never come.
                         const bool output_abandoned = !finished
                             && (!configuration.read_fixed_number_of_rows || current_read_rows < configuration.number_of_rows_to_read);
                         const bool reaped = command->waitDrainingOutput(
@@ -2580,11 +2593,7 @@ namespace
                             check_exit_code,
                             /*unbounded_status_wait=*/ !is_pooled && !output_abandoned,
                             /*limit_stdout_drain=*/ output_abandoned,
-                            [query_status = context->getProcessListElement()]
-                            {
-                                if (query_status)
-                                    query_status->throwIfKilled();
-                            });
+                            queryKilledCheck(context));
 
                         /// As on the pipe path: a status that could not be read is not a passing
                         /// status, whatever the budget was. See the note there.
@@ -3124,8 +3133,18 @@ namespace
             /// command that had the region to itself in between - pages it committed past the end
             /// during that request are what this growth would commit on top of, and a bound that
             /// did not know of them would let the growth take the footprint past the cap and find
-            /// out afterwards. One `fstat` per growth, and growths are amortized.
-            const size_t footprint_before = region.refreshFootprint();
+            /// out afterwards. One `fstat` per growth, and growths are amortized. A region whose
+            /// footprint cannot be read is not handed to the next borrow (see below).
+            size_t footprint_before;
+            try
+            {
+                footprint_before = region.refreshFootprint();
+            }
+            catch (...)
+            {
+                command_is_invalid = true;
+                throw;
+            }
             const size_t expected = region.fillCostUpTo(new_size);
 
             /// Never past the cap, in pages like the footprint: the server's own growth is what
@@ -3187,6 +3206,7 @@ namespace
                 catch (...)
                 {
                     tryLogCurrentException("ShellCommandSource", "Cannot refresh the shared-memory footprint after a failed growth");
+                    command_is_invalid = true;
                     std::rethrow_exception(growth_exception);
                 }
                 const size_t settled = std::max(charged_before, footprint_after);
@@ -3205,23 +3225,35 @@ namespace
                 throw;
             }
 
-            const size_t footprint_after = region.refreshFootprint();
-            added = footprint_after > footprint_before ? footprint_after - footprint_before : 0;
-
-            /// Counted before the charge is settled, not after: the growth has happened and its
-            /// pages are committed, and the settlement below can throw - the few pages the bound
-            /// does not cover (a hole the command punched, refilled by this `posix_fallocate`) are
-            /// charged here, and a query at its limit is failed for them. That is the charge doing
-            /// its job, but it must not also make a growth that really happened invisible in the
-            /// counters. The failure path above counts them for the same reason.
+            /// Counted before anything below can throw, not after: the growth has happened and its
+            /// pages are committed, and both the re-read and the settlement can throw - the few
+            /// pages the bound does not cover (a hole the command punched, refilled by this
+            /// `posix_fallocate`) are charged here, and a query at its limit is failed for them.
+            /// That is the charge doing its job, but it must not also make a growth that really
+            /// happened invisible in the counters. The failure path above counts them for the same
+            /// reason.
             ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryRegionGrowths);
-            ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryAllocatedBytes, added);
 
-            const size_t settled = std::max(charged_before, footprint_after);
-            if (settled < charged)
-                unchargeQueryMemory(charged - settled);
-            else if (settled > charged)
-                chargeQueryMemory(settled - charged);
+            /// A region whose footprint cannot be read after it grew, or whose pages the query could
+            /// not be charged for in full, is not one to hand to the next borrow: the worker goes
+            /// with it, and the query keeps the charge it has until then.
+            try
+            {
+                const size_t footprint_after = region.refreshFootprint();
+                added = footprint_after > footprint_before ? footprint_after - footprint_before : 0;
+                ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryAllocatedBytes, added);
+
+                const size_t settled = std::max(charged_before, footprint_after);
+                if (settled < charged)
+                    unchargeQueryMemory(charged - settled);
+                else if (settled > charged)
+                    chargeQueryMemory(settled - charged);
+            }
+            catch (...)
+            {
+                command_is_invalid = true;
+                throw;
+            }
         }
 
         /// Brings a region that served an earlier borrow into the state this borrow relies on: the

@@ -220,15 +220,20 @@ public:
     /// its output still reaches `stderr_sink`, but a non-zero or signalled exit is not raised.
     ///
     /// `unbounded_status_wait` is for the one caller that used to `wait` for a command with no
-    /// bound at all - the non-pooled command whose output has ended. With it, and with the status
+    /// bound at all - the non-pooled command, whether its output has ended or a consumer abandoned
+    /// it (see `limit_stdout_drain` for how a command that keeps writing is ended then). With it, and with the status
     /// wanted, the wait for the exit status keeps that meaning whatever `command_termination_timeout`
     /// is: the output is drained, so a child blocked in `write` still gets to its exit, but a
     /// command that takes its time over cleanup is waited for exactly as before rather than failed
     /// for it - existing `executable` configurations rely on that. A pooled worker that is being
     /// discarded was never waited for before, and for it the budget is the budget: a worker which
     /// closes its stdout and then never exits must not pin the query, and the pool's slot, forever.
-    /// `limit_stdout_drain` also applies the stray-output limit when the status is checked, for a
-    /// consumer that abandoned the output early. Closing stdout may then produce a failing status.
+    /// `limit_stdout_drain` is for a consumer that abandoned the output early: stdout is closed after
+    /// the stray-output limit even when the status is checked, and also once
+    /// `command_termination_timeout` has passed, however little arrived - so that a command that
+    /// keeps writing dies on `SIGPIPE`, while one that has stopped writing is not affected. The
+    /// `SIGPIPE` is then the command's status like any other. A command that neither writes nor
+    /// exits is waited for, with `unbounded_status_wait`, until `check_cancelled` throws.
     /// `check_cancelled` may throw to interrupt the wait; cancellation also ends the termination
     /// grace period so the destructor can stop the command promptly.
     bool waitDrainingOutput(
@@ -257,6 +262,12 @@ private:
     /// and the number of the group it leads, with `Config::own_process_group` - may belong to
     /// somebody else, so it is neither signalled nor waited for.
     bool child_reaped = false;
+
+    /// Records that the child has been reaped or is not a child of this process any more
+    /// (`child_reaped`): from then on it is neither waited for nor signalled - `wait_called` is set
+    /// too, which is what the destructor looks at - and it leaves `UDFProcessRegistry`, whose
+    /// sampling would otherwise follow its pid to whatever process gets the number next.
+    void forgetChild();
 
     /// Sends `SIGKILL` to the child's process group and reaps the child (`Config::own_process_group`).
     /// Only while the child is still an unreaped child of this process: otherwise the number may
@@ -317,13 +328,15 @@ private:
     /// already in the pipes is read whole however long that takes, and only the wait for more is
     /// bounded - within a hard cap of `max_total_ms`, for a grandchild that keeps the pipe fed.
     /// `stdout_bytes_drained`, if given, is increased by the number of bytes taken off `stdout`.
+    /// `check_cancelled`, if given, is called on every step and may throw to stop the drain.
     void drainOutputPipes(
         int (&drain_fds)[2],
         const StderrSink & stderr_sink,
         UInt64 budget_ms,
         bool budget_is_quiet_time = false,
         UInt64 max_total_ms = 0,
-        size_t * stdout_bytes_drained = nullptr) const;
+        size_t * stdout_bytes_drained = nullptr,
+        const std::function<void()> & check_cancelled = {}) const;
 
     void handleProcessRetcode(int retcode) const;
 

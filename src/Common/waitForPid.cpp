@@ -36,7 +36,6 @@ enum PollPidResult
 #if defined(OS_LINUX)
 
 #include <poll.h>
-#include <string>
 
 #if !defined(__NR_pidfd_open)
     #if defined(__x86_64__)
@@ -106,25 +105,11 @@ static PollPidResult pollPid(pid_t pid, int timeout_in_ms)
     }
     else
     {
-        std::string path = "/proc/" + std::to_string(pid);
-        pid_fd = HANDLE_EINTR(open(path.c_str(), O_DIRECTORY));
-
-        if (pid_fd < 0)
-        {
-            if (errno == ENOENT)
-                return PollPidResult::RESTART;
-
-            return PollPidResult::FAILED;
-        }
-
-        /// A `/proc/<pid>` directory is always ready for `poll`, so polling it waits for nothing,
-        /// and the caller would spin until the process exits. Without a `pidfd` there is nothing
-        /// to wait on: wait a short step instead, and let the caller look again.
-        [[maybe_unused]] int err = close(pid_fd);
-        chassert(!err || errno == EINTR);
-
-        static constexpr int proc_step_ms = 5;
-        poll(nullptr, 0, std::min(timeout_in_ms, proc_step_ms));
+        /// Without a `pidfd` there is nothing to wait on: a `/proc/<pid>` directory is always ready
+        /// for `poll`, so polling it waits for nothing, and whether the process is there at all the
+        /// caller has just found out (`checkPidExited`). Wait a short step, and let it look again.
+        static constexpr int no_pidfd_step_ms = 5;
+        poll(nullptr, 0, std::min(timeout_in_ms, no_pidfd_step_ms));
         return PollPidResult::RESTART;
     }
 
@@ -314,10 +299,9 @@ bool waitForPidMilliseconds(pid_t pid, size_t timeout_in_milliseconds, bool leav
 
     /// If timeout is positive, poll until the process exits or the total wall
     /// clock since function entry exceeds the limit. The remaining budget is
-    /// derived from the `watch` started at function entry (never reset) so
-    /// that the `/proc/<pid>` fallback — whose directory fd is always instantly
-    /// ready, causing `pollPid` to return in ~0 ms — still subtracts real
-    /// elapsed time and cannot busy-spin until the child exits on its own.
+    /// derived from the `watch` started at function entry (never reset), so
+    /// that a `pollPid` that returns early - a signal, or the short steps it
+    /// takes without a `pidfd` - still subtracts real elapsed time.
 
     const Int64 total_timeout_ms = static_cast<Int64>(timeout_in_milliseconds);
     while (true)
