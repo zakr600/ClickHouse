@@ -1,0 +1,4 @@
+--- the growth is refused under a limit the pages the command committed do not fit
+error: MEMORY_LIMIT_EXCEEDED UDF_EXECUTION_FAILED
+--- and goes through without it
+3390

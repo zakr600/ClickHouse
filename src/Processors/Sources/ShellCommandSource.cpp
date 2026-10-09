@@ -282,7 +282,11 @@ public:
         /// that has hung up, an interrupted read. Restarting the timeout at each of them would let
         /// a command that never answers hold the query for as long as it keeps making noise on the
         /// other pipe - which is the same unbounded wait, only reached the long way round.
-        const UInt64 deadline_ns = readDeadlineNs();
+        ///
+        /// And not even one per call while a frame deadline is armed (`armFrameDeadline`): each
+        /// call returns as soon as anything arrives, so a command that drips its answer out a
+        /// byte at a time would otherwise get a fresh budget for every byte.
+        const UInt64 deadline_ns = frame_deadline_ns ? frame_deadline_ns : readDeadlineNs();
 
         while (!bytes_read)
         {
@@ -587,6 +591,12 @@ public:
     /// and that is the last stretch in which a command can still write.
     void consumeStderrBytes(std::string_view str) { consumeStderrChunk(str); }
 
+    /// Makes every read until `disarmFrameDeadline` share one deadline, `timeout_milliseconds`
+    /// from now, rather than each read getting its own: what bounds the time a whole response
+    /// may take to arrive, not just the gap between two of its pieces.
+    void armFrameDeadline() noexcept { frame_deadline_ns = readDeadlineNs(); }
+    void disarmFrameDeadline() noexcept { frame_deadline_ns = 0; }
+
 private:
     /// One chunk of the command's stderr, put through the configured reaction. `NONE` matches
     /// nothing and the bytes are dropped - which is exactly what it is for: they still have to be
@@ -764,6 +774,8 @@ private:
     int stdout_fd;
     int stderr_fd;
     size_t timeout_milliseconds;
+    /// Zero when no frame deadline is armed.
+    UInt64 frame_deadline_ns = 0;
     ExternalCommandStderrReaction stderr_reaction;
     UDFProcessSubtreeSampler * sampler;
     bool final_sample_taken = false;
@@ -1086,14 +1098,18 @@ public:
         last_borrower.reset();
     }
 
-    /// A region is charged to exactly one memory tracker at a time, chosen by who can observe it:
+    /// A region is charged to one memory tracker at a time, chosen by who can observe it:
     /// while the holder is borrowed, the borrowing query's tracker owns the charge, so the memory
     /// limit of that query still covers the region; while the holder sits idle in the process pool
     /// the region stays mapped with no query to charge, so the global tracker owns it instead.
     /// The charge is handed over in both directions rather than taken twice, because a query
     /// charge already propagates up into `total_memory_tracker` — charging both would count the
     /// same bytes twice there and let a handful of pooled workers exhaust
-    /// `max_server_memory_usage` on paper.
+    /// `max_server_memory_usage` on paper. A charge cannot be moved between trackers atomically,
+    /// so for the moment between releasing it on one side and taking it on the other the region
+    /// is charged to neither (see `cleanup`): the global figure is low by the region's size, and
+    /// by the sum of them when several hand-overs coincide. The invariant is about the states
+    /// between hand-overs, not inside them.
     ///
     /// With `memory_worker_correct_memory_tracker` on (the default) `MemoryWorker` replaces the
     /// global tracker's value with a measurement on every tick, and no measurement it uses sees the
@@ -2192,8 +2208,9 @@ namespace
                 /// thread in cleanup(), including when region creation below throws. A pooled region
                 /// outlives the borrow, so the charge for it is handed over from the holder here and
                 /// handed back in cleanup(); the holder accounts it globally while the worker sits
-                /// idle in the pool. Exactly one tracker holds it at any moment — see
-                /// `ShellCommandHolder::releaseChargeToBorrower`. The hand-over happens only right
+                /// idle in the pool. It is never held by both trackers at once, and by neither only
+                /// for the moment of a hand-over - see `ShellCommandHolder::releaseChargeToBorrower`
+                /// and `cleanup`. The hand-over happens only right
                 /// before the query is charged: the checks below may discard the worker, destroying
                 /// it can take up to `command_termination_timeout`, and its region stays resident
                 /// until then, so it stays charged globally until `discardWorkerAndRegion` drops it.
@@ -2683,10 +2700,17 @@ namespace
             UInt64 output_offset = 0;
             UInt64 output_size = 0;
 
+            /// The whole response frame - not each read of it - has `command_read_timeout` to arrive.
+            /// The frame is a handful of varints and at most a capped error message, so a command
+            /// that answers at all answers it in one go; one that trickles it out a byte at a time
+            /// would otherwise hold the query for that many timeouts.
+            SCOPE_EXIT({ timeout_command_out->disarmFrameDeadline(); });
+
             while (true)
             {
                 const UInt64 request_id = nextRequestId();
                 sendRequest(input_size, request_id);
+                timeout_command_out->armFrameDeadline();
 
                 /// Response from the child: the id of the request it is answering, a status varint,
                 /// and then either the output location (on success), the size it needs (when the
@@ -3092,7 +3116,18 @@ namespace
             /// taken from the cached figure, on both paths: the cached one is raised to the length
             /// of the file, and the pages of the command's own that this growth committed on top
             /// (see above) show only in `st_blocks`.
-            chargeQueryMemory(expected);
+            ///
+            /// The charge is brought up to the footprint just re-read before the growth is added on
+            /// top, and settled as a whole against the footprint after it - not by the difference
+            /// the growth made. The command had the region to itself since the charge was last
+            /// settled, and pages it committed in between (`fallocate` past the end, an extended
+            /// file) are in `footprint_before` but not in the charge; settling by the difference
+            /// alone would carry that shortfall past a growth that has measured it. Never below what
+            /// the borrow was charged before: that charge was made for the region as it was handed
+            /// over, and a page the command punched out of it since can come back on the next write.
+            const size_t charged_before = query_memory_charge;
+            const size_t charged = std::max(charged_before, footprint_before) + expected;
+            chargeQueryMemory(charged - charged_before);
 
             size_t added = 0;
             try
@@ -3104,22 +3139,25 @@ namespace
             }
             catch (...)
             {
-                added = refreshFootprintKeepingTheChargeOnFailure(region, footprint_before + expected) - footprint_before;
-                if (expected > added)
-                    unchargeQueryMemory(expected - added);
+                const size_t footprint_after = refreshFootprintKeepingTheChargeOnFailure(region, footprint_before + expected);
+                const size_t settled = std::max(charged_before, footprint_after);
+                if (settled < charged)
+                    unchargeQueryMemory(charged - settled);
                 /// More than the bound, for the one reason the bound does not cover: a page the
                 /// command punched out of the file that `posix_fallocate` committed again before
                 /// the remap failed. The growth failed, but those pages are in the file and the
                 /// file cannot shrink, so the query pays for them exactly as it does on the path
                 /// where the growth succeeds.
-                else if (added > expected)
-                    chargeQueryMemoryNoThrow(added - expected);
+                else if (settled > charged)
+                    chargeQueryMemoryNoThrow(settled - charged);
+                added = footprint_after > footprint_before ? footprint_after - footprint_before : 0;
                 if (added)
                     ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryAllocatedBytes, added);
                 throw;
             }
 
-            added = refreshFootprintKeepingTheChargeOnFailure(region, footprint_before + expected) - footprint_before;
+            const size_t footprint_after = refreshFootprintKeepingTheChargeOnFailure(region, footprint_before + expected);
+            added = footprint_after > footprint_before ? footprint_after - footprint_before : 0;
 
             /// Counted before the charge is settled, not after: the growth has happened and its
             /// pages are committed, and the settlement below can throw - the few pages the bound
@@ -3130,10 +3168,11 @@ namespace
             ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryRegionGrowths);
             ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryAllocatedBytes, added);
 
-            if (added < expected)
-                unchargeQueryMemory(expected - added);
-            else if (added > expected)
-                chargeQueryMemory(added - expected);
+            const size_t settled = std::max(charged_before, footprint_after);
+            if (settled < charged)
+                unchargeQueryMemory(charged - settled);
+            else if (settled > charged)
+                chargeQueryMemory(settled - charged);
         }
 
         /// Takes anything a previous borrow's command left on its stderr off the pipe, without
