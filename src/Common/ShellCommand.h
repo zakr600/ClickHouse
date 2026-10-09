@@ -179,6 +179,16 @@ public:
     /// or signalled exit is not raised as an error. Returns whether the child was waited.
     bool tryWaitWithoutStatusCheck();
 
+    /// How long the command is given to exit on its own before it is signalled
+    /// (`command_termination_timeout`). Zero means it is given no time at all, which a caller that
+    /// wants the exit status has to know about: there is then no difference between a command that
+    /// is slow to exit and one that never will, and reporting the second is not warranted.
+    UInt64 terminationTimeoutSeconds() const
+    {
+        return config.terminate_in_destructor_strategy.wait_for_normal_exit_before_termination_seconds;
+    }
+
+    using StderrSink = std::function<void(std::string_view)>;
     /// Wait for a child that is being thrown away, discarding whatever it writes to `stdout` and
     /// `stderr` meanwhile, bounded by the shared `command_termination_timeout` budget.
     ///
@@ -217,16 +227,6 @@ public:
     /// for it - existing `executable` configurations rely on that. A pooled worker that is being
     /// discarded was never waited for before, and for it the budget is the budget: a worker which
     /// closes its stdout and then never exits must not pin the query, and the pool's slot, forever.
-    /// How long the command is given to exit on its own before it is signalled
-    /// (`command_termination_timeout`). Zero means it is given no time at all, which a caller that
-    /// wants the exit status has to know about: there is then no difference between a command that
-    /// is slow to exit and one that never will, and reporting the second is not warranted.
-    UInt64 terminationTimeoutSeconds() const
-    {
-        return config.terminate_in_destructor_strategy.wait_for_normal_exit_before_termination_seconds;
-    }
-
-    using StderrSink = std::function<void(std::string_view)>;
     bool waitDrainingOutput(const StderrSink & stderr_sink = {}, bool check_exit_status = true, bool unbounded_status_wait = false);
 
     WriteBufferFromFile in;        /// If the command reads from stdin, do not forget to call in.close() after writing all the data there.

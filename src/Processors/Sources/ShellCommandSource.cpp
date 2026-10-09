@@ -1824,7 +1824,11 @@ namespace
             }
             catch (...)
             {
-                tryLogCurrentException("ShellCommandSource");
+                /// The earlier query's stderr may still be on the pipe, or the command still blocked
+                /// writing it: the worker is not at a known boundary, so it is not built on. The
+                /// query fails, and the worker does not go back to the pool.
+                command_is_invalid = true;
+                throw;
             }
 
             const auto state = timeout_command_out.channelState();
@@ -2205,9 +2209,9 @@ namespace
                 ///
                 /// The region is charged to this query's memory tracker for the whole borrow, so
                 /// they count against its memory limit; the charge is released on the same (query)
-                /// thread in cleanup(), including when region creation below throws. A pooled region
+                /// thread in `cleanup`, including when region creation below throws. A pooled region
                 /// outlives the borrow, so the charge for it is handed over from the holder here and
-                /// handed back in cleanup(); the holder accounts it globally while the worker sits
+                /// handed back in `cleanup`; the holder accounts it globally while the worker sits
                 /// idle in the pool. It is never held by both trackers at once, and by neither only
                 /// for the moment of a hand-over - see `ShellCommandHolder::releaseChargeToBorrower`
                 /// and `cleanup`. The hand-over happens only right
@@ -2437,7 +2441,7 @@ namespace
                     }
 
                     /// On the pool path we cannot rely on stdin EOF; stop once enough rows were produced.
-                    /// On the non-pooled path the child exits on stdin EOF, so close it before wait().
+                    /// On the non-pooled path the child exits on stdin EOF, so close it before `wait`.
                     if (configuration.read_fixed_number_of_rows && current_read_rows >= configuration.number_of_rows_to_read)
                     {
                         closeStdinIfNeeded(is_pooled);
@@ -2499,7 +2503,7 @@ namespace
                 if (!keep_command)
                     recordPooledResourceUsageNoThrow();
 
-                /// The source can finish without generate() reaching the end of the input — most
+                /// The source can finish without `generate` reaching the end of the input — most
                 /// notably on cancellation. A child that is not going back to the pool only exits
                 /// once it sees EOF on its stdin, so close it before the blocking wait below, which
                 /// reaps the child before closing any pipe itself.
@@ -2960,7 +2964,7 @@ namespace
         /// address. We therefore intentionally do NOT emit allocation-profiler samples
         /// (AllocationTrace::onAlloc / onFree) for them — a sample carrying a fake pointer would only
         /// pollute allocation profiles. The memory-tracker counter (used for the memory limit) is
-        /// still updated by alloc() / free() regardless, and so is `MemoryTrackingUnmeasured`: the
+        /// still updated by `alloc` / `free` regardless, and so is `MemoryTrackingUnmeasured`: the
         /// pages are not in the measurement `MemoryWorker` corrects the global tracker with, and
         /// without it the share of this charge that reaches the global tracker would be gone on its
         /// next tick. chargeQueryMemory may throw MEMORY_LIMIT_EXCEEDED before it records the charge,
@@ -3022,7 +3026,7 @@ namespace
         /// if needed. Growth doubles the size to amortize repeated growths. `what` names whose
         /// requirement this is, for the exception raised when the region cannot grow that far. The
         /// added bytes are charged to the query memory tracker like the rest of the region; for a
-        /// pooled region cleanup() hands that charge over to the holder together with the region.
+        /// pooled region `cleanup` hands that charge over to the holder together with the region.
         void ensureRegionFits(size_t required, std::string_view what, bool required_is_lower_bound = false)
         {
             auto & region = *shared_memory_region;
@@ -3139,7 +3143,9 @@ namespace
             }
             catch (...)
             {
-                const size_t footprint_after = refreshFootprintKeepingTheChargeOnFailure(region, footprint_before + expected);
+                /// A re-read that fails here or below propagates, and leaves the whole charge
+                /// made for the growth in place: the safe side, with pages that may be there.
+                const size_t footprint_after = region.refreshFootprint();
                 const size_t settled = std::max(charged_before, footprint_after);
                 if (settled < charged)
                     unchargeQueryMemory(charged - settled);
@@ -3156,7 +3162,7 @@ namespace
                 throw;
             }
 
-            const size_t footprint_after = refreshFootprintKeepingTheChargeOnFailure(region, footprint_before + expected);
+            const size_t footprint_after = region.refreshFootprint();
             added = footprint_after > footprint_before ? footprint_after - footprint_before : 0;
 
             /// Counted before the charge is settled, not after: the growth has happened and its
@@ -3175,16 +3181,6 @@ namespace
                 chargeQueryMemory(settled - charged);
         }
 
-        /// Takes anything a previous borrow's command left on its stderr off the pipe, without
-        /// putting it through `stderr_reaction`.
-        ///
-        /// The probe that decides whether a worker may be pooled is one instant, so a command that
-        /// writes a moment after answering slips past it and its bytes are sitting there when the
-        /// next query borrows the process. Those bytes belong to the query that caused them, and
-        /// that query is over; running them through the reaction here would fail *this* query for
-        /// something it did not do, which under `stderr_reaction` `throw` is the difference between
-        /// a confusing failure and a wrong accusation. They are logged instead, so they are not
-        /// lost, and the query that borrows the worker is left alone.
         /// Brings a region that served an earlier borrow into the state this borrow relies on: the
         /// whole file mapped.
         ///
@@ -3249,30 +3245,11 @@ namespace
                 /// is given back, and pages the command freed under the length and replaced past it
                 /// - which the bound cannot see, the count being the same - are charged now that
                 /// the re-read sees them.
-                const size_t footprint_after = refreshFootprintKeepingTheChargeOnFailure(region, footprint + fill);
+                const size_t footprint_after = region.refreshFootprint();
                 if (footprint_after < footprint + fill)
                     unchargeQueryMemory(footprint + fill - footprint_after);
                 else if (footprint_after > footprint + fill)
                     chargeQueryMemory(footprint_after - footprint - fill);
-            }
-        }
-
-        /// The footprint re-read after a growth, to settle the charge made before it. A re-read
-        /// that fails answers with the figure the charge was made for, `charged`: the pages may
-        /// be there, and a charge for pages that are there is the safe side, while the cached
-        /// figure - raised to the length of the file, never to the pages the command committed
-        /// past it - could be lower than what the growth committed and give back a charge for
-        /// pages that stay.
-        static size_t refreshFootprintKeepingTheChargeOnFailure(SharedMemoryRegion & region, size_t charged)
-        {
-            try
-            {
-                return region.refreshFootprint();
-            }
-            catch (...)
-            {
-                tryLogCurrentException("ShellCommandSharedMemorySource", "Cannot re-read the size of a shared-memory region after a growth; keeping the charge made for it");
-                return std::max(region.footprint(), charged);
             }
         }
 
@@ -3339,7 +3316,7 @@ namespace
                 ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryScrubbedBytes, region.size());
 
                 const size_t charged = charged_before + worst_case;
-                const size_t footprint_after = refreshFootprintKeepingTheChargeOnFailure(region, charged);
+                const size_t footprint_after = region.refreshFootprint();
                 if (region.isOverTheCap(shared_memory_max_size))
                     failBorrowOnRegionOverTheCap(std::max(region.backingSize(), region.costOnceMappedWhole()));
 
@@ -3398,6 +3375,16 @@ namespace
             return true;
         }
 
+        /// Takes anything a previous borrow's command left on its stderr off the pipe, without
+        /// putting it through `stderr_reaction`.
+        ///
+        /// The probe that decides whether a worker may be pooled is one instant, so a command that
+        /// writes a moment after answering slips past it and its bytes are sitting there when the
+        /// next query borrows the process. Those bytes belong to the query that caused them, and
+        /// that query is over; running them through the reaction here would fail *this* query for
+        /// something it did not do, which under `stderr_reaction` `throw` is the difference between
+        /// a confusing failure and a wrong accusation. They are logged instead, so they are not
+        /// lost, and the query that borrows the worker is left alone.
         void discardStderrLeftByAPreviousBorrow()
         {
             /// Only a worker that served an earlier borrow can have left anything: a process
@@ -3428,7 +3415,10 @@ namespace
             }
             catch (...)
             {
-                tryLogCurrentException("ShellCommandSharedMemorySource");
+                /// Not at a known boundary, as in `quarantineReusedWorker`: the worker is discarded
+                /// rather than built on, and the query fails.
+                command_is_invalid = true;
+                throw;
             }
         }
 
@@ -3605,7 +3595,7 @@ namespace
 
             /// The constructor can fail before the write buffer exists - while creating a region or
             /// charging its memory. The child is already running and blocked in read by then, so
-            /// its stdin still has to be closed: otherwise the wait in cleanup() and in
+            /// its stdin still has to be closed: otherwise the wait in `cleanup` and in
             /// ~ShellCommand blocks for the whole command_termination_timeout before the child is
             /// signalled.
             ///
@@ -3679,7 +3669,7 @@ namespace
         {
             /// Tear down the output pipeline first. Its parsing threads (input_format_parallel_parsing)
             /// read straight out of the shared-memory region through output_read_buffer, so they must be
-            /// joined before the child is reaped and before the region is unmapped below. generate()
+            /// joined before the child is reaped and before the region is unmapped below. `generate`
             /// does this in order on the normal path; here it also covers the destructor path (query
             /// cancellation, an exception downstream) where the pipeline is still alive.
             output_executor.reset();
@@ -3723,7 +3713,7 @@ namespace
             recordPooledResourceUsageNoThrow();
 
             /// A child that is not going back to the pool exits on stdin EOF, so its stdin must be
-            /// closed here as well: generate() closes it on the normal path, but not when the source
+            /// closed here as well: `generate` closes it on the normal path, but not when the source
             /// is torn down before that (query cancellation, an exception downstream), and never for
             /// a pooled worker, which only turns out to be discarded at this point. A child left
             /// blocked in read(stdin) would make the sampler's wait below spin for the whole
@@ -3842,6 +3832,16 @@ namespace
                 region_created_by_this_borrow = false;
             }
 
+            /// A non-pooled command and its region go before the charge for the region does, by the
+            /// same rule as a discarded pooled worker above: `~ShellCommand` can wait up to
+            /// `command_termination_timeout` for a command that was not waited for (`check_exit_code`
+            /// off, a cancelled query), and the region stays resident until the command is gone.
+            if (!command_holder)
+            {
+                command = nullptr;
+                shared_memory_region.reset();
+            }
+
             /// Release the per-borrow memory charge on the query thread.
             if (query_memory_charge)
                 unchargeQueryMemory(query_memory_charge);
@@ -3889,7 +3889,7 @@ namespace
         bool constructor_finished = false;
 
         /// Set while the input for the next request is being serialized, before that request is
-        /// sent to the child - see the catch-all in generate(). Only ever read on the query thread.
+        /// sent to the child - see the catch-all in `generate`. Only ever read on the query thread.
         bool preparing_input = false;
 
         /// Set when input preparation fails before a request reaches a pooled child. Unlike an
@@ -3937,7 +3937,7 @@ namespace
 
         /// output_read_buffer points into the region's mapping and is read by the output pipeline
         /// (including its parallel-parsing threads), so it must outlive the pipeline:
-        /// declared first, therefore destroyed last. cleanup() tears all three down in order.
+        /// declared first, therefore destroyed last. `cleanup` tears all three down in order.
         std::unique_ptr<ReadBufferFromMemory> output_read_buffer;
         QueryPipeline output_pipeline;
         std::unique_ptr<PullingPipelineExecutor> output_executor;
@@ -4132,6 +4132,10 @@ Pipe ShellCommandSourceCoordinator::createPipe(
                     process->getPid(),
                     leftover_stderr);
 
+            /// A hung-up stdout does not prove the process is gone: one that closed its stdout and
+            /// went on reading its stdin would have `~ShellCommand` sit out the termination timeout
+            /// on this query. Closing its inputs lets it exit on EOF, as on the shared-memory path.
+            process->closeInputs();
             process.reset();
             process = process_holder->buildCommand();
             worker_is_reused = false;

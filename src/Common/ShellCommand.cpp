@@ -1126,9 +1126,14 @@ bool ShellCommand::waitDrainingOutput(const StderrSink & stderr_sink, bool check
 
         if (drain_fds[0] < 0 && drain_fds[1] < 0)
         {
-            /// Nothing left to drain, only a child that has not exited yet. Wait out the rest of
-            /// the budget in the same steps rather than polling an empty set in a tight loop.
-            sleepForMilliseconds(step_ms);
+            /// Nothing left to drain, only a child that has not exited yet. Without a bound, block
+            /// until it exits (left unreaped, for the `waitpid` above to collect). Otherwise wait
+            /// out the rest of the budget in the same steps rather than polling an empty set in a
+            /// tight loop.
+            if (unbounded)
+                peekChildState(pid, /*blocking=*/ true);
+            else
+                sleepForMilliseconds(step_ms);
             continue;
         }
 

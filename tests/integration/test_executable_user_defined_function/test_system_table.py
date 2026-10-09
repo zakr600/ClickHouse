@@ -292,7 +292,6 @@ def test_system_user_defined_functions_columns(started_cluster):
         "command_termination_timeout",
         "command_read_timeout",
         "command_write_timeout",
-        "command_pipe_capacity",
         "pool_size",
         "send_chunk_header",
         "execute_direct",
@@ -304,6 +303,7 @@ def test_system_user_defined_functions_columns(started_cluster):
         "use_shared_memory",
         "shared_memory_size",
         "shared_memory_max_size",
+        "command_pipe_capacity",
     ]
 
     actual_columns = result.strip().split('\n')
