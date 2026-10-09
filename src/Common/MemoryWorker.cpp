@@ -873,7 +873,17 @@ void MemoryWorker::updateResidentMemoryThread()
 
             Stopwatch total_watch;
 
-            const MemoryUsage memory_usage = getMemoryUsage(first_run);
+            MemoryUsage memory_usage = getMemoryUsage(first_run);
+
+            /// Shared-memory pages charged to the trackers are absent from jemalloc's resident
+            /// size, sanitizer allocator statistics, and the cgroup's `anon`/`rss` measurements.
+            /// Include the same snapshot in both RSS and allocated memory before computing any
+            /// headroom. Otherwise `updateRSS` drops these charges on every tick, allowing the
+            /// combined footprint to exceed the server limit when tracker correction is disabled
+            /// or sanitizer overhead makes RSS larger than the allocated counter.
+            const Int64 unmeasured = CurrentMetrics::get(CurrentMetrics::MemoryTrackingUnmeasured);
+            memory_usage.resident += unmeasured;
+            memory_usage.allocated += unmeasured;
 
             /// Speculatively reserve growth headroom on top of the observed RSS.
             /// `resident - prev_resident` is how much RSS actually grew during the last tick;
@@ -1017,19 +1027,10 @@ void MemoryWorker::updateResidentMemoryThread()
             /// When the tracker is not corrected on this tick, refresh `MemoryTrackingUncorrected`
             /// anyway, so that the metric stays a snapshot of the plain counter that is at most
             /// one tick old in both modes.
-            ///
-            /// The measurement does not see every byte the trackers are charged for: the pages of a
-            /// shared-memory file the server maps (the regions of executable UDFs) are `shmem`, which
-            /// is neither in jemalloc's resident size, nor in a sanitizer's allocator statistic, nor
-            /// in the `anon`/`rss` figures read from the cgroup. Those charges are counted in
-            /// `MemoryTrackingUnmeasured` and added on top, so that a correction does not wipe them
-            /// out of the tracker that `max_server_memory_usage` is enforced against.
-            const Int64 unmeasured = CurrentMetrics::get(CurrentMetrics::MemoryTrackingUnmeasured);
-            const Int64 corrected_amount = memory_usage.allocated + unmeasured;
             if (first_run || total_memory_tracker.get() < 0) [[unlikely]]
-                MemoryTracker::updateAllocated(corrected_amount, /*log_change=*/true);
+                MemoryTracker::updateAllocated(memory_usage.allocated, /*log_change=*/true);
             else if (correct_tracker)
-                MemoryTracker::updateAllocated(corrected_amount, /*log_change=*/false);
+                MemoryTracker::updateAllocated(memory_usage.allocated, /*log_change=*/false);
             else
                 MemoryTracker::updateUncorrected();
 
@@ -1063,13 +1064,7 @@ void MemoryWorker::updateResidentMemoryThread()
                         /// are excluded. Under load `tracked` can be orders of magnitude smaller
                         /// than the actual RSS, which makes `(tracked + available) * ratio` compute
                         /// a hard limit close to current RSS and reject every subsequent allocation.
-                        ///
-                        /// `resident` does not include the shared-memory pages counted in
-                        /// `MemoryTrackingUnmeasured` (see above), while `available` does treat them
-                        /// as taken, and the tracker is charged for them. Add them here, so that
-                        /// `used + available` still covers all the memory we could own, and the
-                        /// `used + safety_margin` floor below stays above the tracker.
-                        Int64 used = std::max<Int64>(0, memory_usage.resident) + std::max<Int64>(0, unmeasured);
+                        Int64 used = std::max<Int64>(0, memory_usage.resident);
                         /// `used + available` is the upper bound of memory we could potentially own:
                         /// what we already use plus what is still free in our cgroup (or on the host).
                         /// Scaling by `ratio < 1` leaves headroom for other processes on the host.

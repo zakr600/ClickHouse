@@ -25,6 +25,7 @@ namespace DB::ErrorCodes
 {
     extern const int CANNOT_CREATE_CHILD_PROCESS;
     extern const int CHILD_WAS_NOT_EXITED_NORMALLY;
+    extern const int QUERY_WAS_CANCELLED;
 }
 
 
@@ -435,4 +436,35 @@ TEST(ShellCommand, WaitDrainingOutputKeepsStderrOfASignalledChild)
     std::string collected;
     EXPECT_THROW(command->waitDrainingOutput([&](std::string_view chunk) { collected += chunk; }), DB::Exception);
     EXPECT_EQ(collected, "boom");
+}
+
+
+TEST(ShellCommand, WaitDrainingOutputCanCancelAfterOutputCloses)
+{
+    ShellCommand::Config config("exec 1>&- 2>&-; read value");
+    config.terminate_in_destructor_strategy = ShellCommand::DestructorStrategy(true, SIGTERM, 86400);
+    auto command = ShellCommand::execute(config);
+
+    /// Keep stdin open so the child cannot exit on its own. Once both output pipes are
+    /// closed, an unbounded blocking wait would never reach the cancellation check again.
+    std::string output;
+    readStringUntilEOF(output, command->out);
+    readStringUntilEOF(output, command->err);
+    size_t checks = 0;
+    try
+    {
+        command->waitDrainingOutput(
+            {}, /*check_exit_status=*/ true, /*unbounded_status_wait=*/ true, /*limit_stdout_drain=*/ false,
+            [&]
+            {
+                if (++checks == 3)
+                    throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "Cancelled shell command wait");
+            });
+        FAIL() << "Expected cancellation";
+    }
+    catch (const Exception & exception)
+    {
+        EXPECT_EQ(exception.code(), ErrorCodes::QUERY_WAS_CANCELLED);
+    }
+    EXPECT_EQ(checks, 3);
 }

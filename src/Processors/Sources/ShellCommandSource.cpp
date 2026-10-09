@@ -31,6 +31,7 @@
 #include <Common/SharedMemoryRegion.h>
 #include <Formats/formatBlock.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/ProcessList.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/Formats/IOutputFormat.h>
 #include <Processors/ISimpleTransform.h>
@@ -550,7 +551,7 @@ public:
     /// query, under `throw`, for a diagnostic it did not cause. The caller has already read and
     /// reported what it could of them (`consumePendingStderrWithoutReaction`, which is capped);
     /// this takes the rest, and whatever the command keeps writing during the drain, the same way.
-    void drainStderrFully(size_t budget_milliseconds, bool with_reaction = true)
+    void drainStderrFully(size_t budget_milliseconds, bool with_reaction = true, size_t bytes_already_read = 0)
     {
         const UInt64 deadline_ns = clock_gettime_ns() + static_cast<UInt64>(budget_milliseconds) * 1000000ULL;
 
@@ -569,7 +570,9 @@ public:
         /// `PIPE_BUF` bytes in it: far more with the default capacity of 64 KiB, and still more
         /// with the two pages that a recent kernel gives a pipe over the per-user limit.
         static constexpr size_t wait_for_writer_ms = 20;
-        size_t bytes_read = 0;
+        /// Include bytes consumed for the borrow's diagnostic: together with this drain they may
+        /// empty a two-page pipe and wake a blocked writer, even if neither read exceeds `PIPE_BUF`.
+        size_t bytes_read = bytes_already_read;
 
         while (!stderr_is_done)
         {
@@ -1642,8 +1645,8 @@ namespace
                         /// and `wait` reaps before it closes anything, so it would never return.
                         /// Draining lets the command reach its own exit.
                         ///
-                        /// With `check_exit_code` a non-pooled command is waited for without a
-                        /// bound, as the blocking `wait` this replaces did: a command whose cleanup
+                        /// With `check_exit_code` a non-pooled command whose output completed is
+                        /// waited for without a bound, as the blocking `wait` this replaces did: a command whose cleanup
                         /// outlasts `command_termination_timeout` and then exits successfully passes,
                         /// as it always has. A pooled worker being discarded was never waited for, and
                         /// it gets `command_termination_timeout` and no more; one that does not exit
@@ -1659,15 +1662,24 @@ namespace
                         /// the same `command_termination_timeout` before it signals, and the two
                         /// waits draw from one deadline (`remainingTerminationTimeoutMs`), so the
                         /// budget is spent once, here instead of there.
+                        /// A downstream `LIMIT` can finish the port before the source reaches EOF.
+                        /// Do not keep an endless producer alive by draining it indefinitely.
+                        const bool output_abandoned = !finished
+                            && (!configuration.read_fixed_number_of_rows || current_read_rows < configuration.number_of_rows_to_read);
                         const bool reaped = command->waitDrainingOutput(
                             [this](std::string_view str) { timeout_command_out.consumeStderrBytes(str); },
                             check_exit_code,
-                            /*unbounded_status_wait=*/ !process_pool);
+                            /*unbounded_status_wait=*/ !process_pool && !output_abandoned,
+                            /*limit_stdout_drain=*/ output_abandoned,
+                            [query_status = context->getProcessListElement()]
+                            {
+                                if (query_status)
+                                    query_status->throwIfKilled();
+                            });
 
                         /// A status that could not be read is not a passing status, and that holds
-                        /// however little time the command was given. Only a pooled worker gets here:
-                        /// for a non-pooled command the wait for the status has no bound, so `reaped`
-                        /// is always true when it is checked. Waving a lingering worker through with
+                        /// however little time the command was given. Pooled workers and commands whose
+                        /// output was abandoned are waited for within a bound. Waving one through with
                         /// a warning would make `check_exit_code` mean "checked, unless the timeout is
                         /// short", which is not a contract anyone can rely on.
                         if (!reaped && check_exit_code)
@@ -1752,7 +1764,15 @@ namespace
             try
             {
                 const bool reaped = command->waitDrainingOutput(
-                    [this](std::string_view str) { timeout_command_out.consumeStderrBytes(str); }, /*check_exit_status=*/ true);
+                    [this](std::string_view str) { timeout_command_out.consumeStderrBytes(str); },
+                    /*check_exit_status=*/ true,
+                    /*unbounded_status_wait=*/ false,
+                    /*limit_stdout_drain=*/ false,
+                    [query_status = context->getProcessListElement()]
+                    {
+                        if (query_status)
+                            query_status->throwIfKilled();
+                    });
 
                 /// The same rule as the wait in `prepare` that discards a worker: a status that could
                 /// not be read within `command_termination_timeout` is not a passing status. A worker
@@ -1820,7 +1840,7 @@ namespace
                 /// The report above is capped; the pipe must not be. What is left beyond the cap,
                 /// and what the command writes while this drains, is the same earlier query's and
                 /// is dropped without the reaction for the same reason.
-                timeout_command_out.drainStderrFully(stderr_drain_budget_ms, /*with_reaction=*/ false);
+                timeout_command_out.drainStderrFully(stderr_drain_budget_ms, /*with_reaction=*/ false, leftover_stderr.size());
             }
             catch (...)
             {
@@ -2073,7 +2093,7 @@ namespace
       * the command cannot take a page out from under this buffer.
       *
       * `grow` must make the region hold at least `required` bytes or throw. Enlarging a region
-      * replaces its mapping, so `data()` is re-read after every growth; the bytes written so far
+      * replaces its mapping, so `data` is re-read after every growth; the bytes written so far
       * survive it, because the file behind the mapping keeps its contents.
       */
     class WriteBufferToSharedMemoryRegion : public WriteBuffer
@@ -2156,7 +2176,7 @@ namespace
 
     /** Exchanges data with the child process through a shared-memory region instead of the pipes.
       *
-      * The protocol is strictly lock-step and driven synchronously from generate() (see the full
+      * The protocol is strictly lock-step and driven synchronously from `generate` (see the full
       * specification in docs/reference/functions/regular-functions/udf.mdx, "Shared memory mode"):
       *   1. pull the next input chunk and serialize it into the shared-memory region;
       *   2. write a request to the child's stdin:
@@ -2553,10 +2573,18 @@ namespace
                         /// its way out; that spends the budget `~ShellCommand` would otherwise
                         /// spend before signalling it, not a second one (the two waits share one
                         /// deadline), so nothing is stalled that was not stalled before.
+                        const bool output_abandoned = !finished
+                            && (!configuration.read_fixed_number_of_rows || current_read_rows < configuration.number_of_rows_to_read);
                         const bool reaped = command->waitDrainingOutput(
                             [this](std::string_view str) { timeout_command_out->consumeStderrBytes(str); },
                             check_exit_code,
-                            /*unbounded_status_wait=*/ !is_pooled);
+                            /*unbounded_status_wait=*/ !is_pooled && !output_abandoned,
+                            /*limit_stdout_drain=*/ output_abandoned,
+                            [query_status = context->getProcessListElement()]
+                            {
+                                if (query_status)
+                                    query_status->throwIfKilled();
+                            });
 
                         /// As on the pipe path: a status that could not be read is not a passing
                         /// status, whatever the budget was. See the note there.
@@ -2700,6 +2728,10 @@ namespace
         {
             ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryCalls);
             ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryInputBytes, input_size);
+            /// The pipe buffers account for control frames; account for the payload once,
+            /// even if the command requests more space and the control request is retried.
+            if (configuration.sampler)
+                configuration.sampler->recordInputBytes(input_size);
 
             UInt64 output_offset = 0;
             UInt64 output_size = 0;
@@ -2805,6 +2837,8 @@ namespace
                     output_offset, output_size, region.size());
 
             ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryOutputBytes, output_size);
+            if (configuration.sampler)
+                configuration.sampler->recordOutputBytes(output_size);
 
             /// Parsed where it lies. The region is sealed against shrinking, so the bytes the
             /// command just reported are backed by pages that cannot go away under the parser -
@@ -3143,9 +3177,19 @@ namespace
             }
             catch (...)
             {
-                /// A re-read that fails here or below propagates, and leaves the whole charge
-                /// made for the growth in place: the safe side, with pages that may be there.
-                const size_t footprint_after = region.refreshFootprint();
+                /// If the footprint cannot be refreshed, retain the conservative charge and
+                /// preserve the growth failure that brought us here.
+                const auto growth_exception = std::current_exception();
+                size_t footprint_after;
+                try
+                {
+                    footprint_after = region.refreshFootprint();
+                }
+                catch (...)
+                {
+                    tryLogCurrentException("ShellCommandSource", "Cannot refresh the shared-memory footprint after a failed growth");
+                    std::rethrow_exception(growth_exception);
+                }
                 const size_t settled = std::max(charged_before, footprint_after);
                 if (settled < charged)
                     unchargeQueryMemory(charged - settled);
@@ -3404,7 +3448,7 @@ namespace
                 /// blocked in `write` and will not read this borrow's request until there is room.
                 /// What is left beyond the cap, and what the command writes while this drains, is
                 /// the same earlier query's and is dropped without the reaction for the same reason.
-                timeout_command_out->drainStderrFully(stderr_drain_budget_ms, /*with_reaction=*/ false);
+                timeout_command_out->drainStderrFully(stderr_drain_budget_ms, /*with_reaction=*/ false, leftover.size());
                 if (!leftover.empty())
                     LOG_WARNING(
                         getLogger("ShellCommandSharedMemorySource"),
@@ -4132,10 +4176,6 @@ Pipe ShellCommandSourceCoordinator::createPipe(
                     process->getPid(),
                     leftover_stderr);
 
-            /// A hung-up stdout does not prove the process is gone: one that closed its stdout and
-            /// went on reading its stdin would have `~ShellCommand` sit out the termination timeout
-            /// on this query. Closing its inputs lets it exit on EOF, as on the shared-memory path.
-            process->closeInputs();
             process.reset();
             process = process_holder->buildCommand();
             worker_is_reused = false;

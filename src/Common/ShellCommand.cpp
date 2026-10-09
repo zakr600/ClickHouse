@@ -703,7 +703,8 @@ int ShellCommand::tryWait()
 
 ShellCommand::tryWaitResult ShellCommand::tryWaitImpl(bool blocking, bool check_exit_status, bool close_streams)
 {
-    LOG_TRACE(getLogger(), "Will wait for shell command pid {}", pid);
+    if (blocking)
+        LOG_TRACE(getLogger(), "Will wait for shell command pid {}", pid);
 
     ShellCommand::tryWaitResult result;
 
@@ -1021,8 +1022,14 @@ void ShellCommand::drainOutputPipes(
 }
 
 
-bool ShellCommand::waitDrainingOutput(const StderrSink & stderr_sink, bool check_exit_status, bool unbounded_status_wait)
+bool ShellCommand::waitDrainingOutput(
+    const StderrSink & stderr_sink,
+    bool check_exit_status,
+    bool unbounded_status_wait,
+    bool limit_stdout_drain,
+    const std::function<void()> & check_cancelled)
 {
+    LOG_TRACE(getLogger(), "Will wait for shell command pid {} while draining its output", pid);
     /// A child that writes past what the protocol asked of it fills the pipe and blocks in `write`.
     /// Nothing reads that pipe any more by the time this is called, so the only way the child ever
     /// reaches its own exit is if the bytes keep being taken off the pipe here and thrown away.
@@ -1050,15 +1057,28 @@ bool ShellCommand::waitDrainingOutput(const StderrSink & stderr_sink, bool check
     /// kind, and the diagnostic is lost with it. The alternative - keeping stdout open for as long
     /// as a stderr sink is wanted - would make every `LIMIT` over a streaming command wait out
     /// the whole termination budget under the default `stderr_reaction`, which is the common
-    /// case; a diagnostic behind 64 KiB of stray output is not. With the status checked the
-    /// stdout stays open however much arrives: the child has to reach its own exit for its status
-    /// to mean anything.
+    /// case; a diagnostic behind 64 KiB of stray output is not. With the status checked, stdout
+    /// stays open unless the caller explicitly abandoned the output early, such as under `LIMIT`.
+    /// In that case the actual exit status, including a possible `SIGPIPE`, is still checked.
     static constexpr size_t stray_stdout_limit = 64 * 1024;
     size_t stdout_bytes_drained = 0;
 
     while (true)
     {
-        if (!check_exit_status && drain_fds[0] >= 0 && stdout_bytes_drained > stray_stdout_limit)
+        if (check_cancelled)
+        {
+            try
+            {
+                check_cancelled();
+            }
+            catch (...)
+            {
+                termination_deadline_ns = clock_gettime_ns();
+                throw;
+            }
+        }
+
+        if ((!check_exit_status || limit_stdout_drain) && drain_fds[0] >= 0 && stdout_bytes_drained > stray_stdout_limit)
         {
             out.close();
             drain_fds[0] = -1;
@@ -1126,14 +1146,13 @@ bool ShellCommand::waitDrainingOutput(const StderrSink & stderr_sink, bool check
 
         if (drain_fds[0] < 0 && drain_fds[1] < 0)
         {
-            /// Nothing left to drain, only a child that has not exited yet. Without a bound, block
-            /// until it exits (left unreaped, for the `waitpid` above to collect). Otherwise wait
-            /// out the rest of the budget in the same steps rather than polling an empty set in a
-            /// tight loop.
-            if (unbounded)
+            /// Nothing left to drain, only a child that has not exited yet. Block on its exit when
+            /// no timeout or cancellation needs checking; otherwise poll with a timeout so the
+            /// outer loop can check both without spinning.
+            if (unbounded && !check_cancelled)
                 peekChildState(pid, /*blocking=*/ true);
-            else
-                sleepForMilliseconds(step_ms);
+            else if (::poll(nullptr, 0, static_cast<int>(step_ms)) < 0 && errno != EINTR)
+                throw ErrnoException(ErrorCodes::CANNOT_WAITPID, "Cannot poll while waiting for shell command pid {}", pid);
             continue;
         }
 
@@ -1176,4 +1195,3 @@ UInt64 ShellCommand::getChildSystemTimeMicroseconds() const noexcept
 
 
 }
-

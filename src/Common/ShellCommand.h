@@ -227,7 +227,16 @@ public:
     /// for it - existing `executable` configurations rely on that. A pooled worker that is being
     /// discarded was never waited for before, and for it the budget is the budget: a worker which
     /// closes its stdout and then never exits must not pin the query, and the pool's slot, forever.
-    bool waitDrainingOutput(const StderrSink & stderr_sink = {}, bool check_exit_status = true, bool unbounded_status_wait = false);
+    /// `limit_stdout_drain` also applies the stray-output limit when the status is checked, for a
+    /// consumer that abandoned the output early. Closing stdout may then produce a failing status.
+    /// `check_cancelled` may throw to interrupt the wait; cancellation also ends the termination
+    /// grace period so the destructor can stop the command promptly.
+    bool waitDrainingOutput(
+        const StderrSink & stderr_sink = {},
+        bool check_exit_status = true,
+        bool unbounded_status_wait = false,
+        bool limit_stdout_drain = false,
+        const std::function<void()> & check_cancelled = {});
 
     WriteBufferFromFile in;        /// If the command reads from stdin, do not forget to call in.close() after writing all the data there.
     ReadBufferFromFile out;

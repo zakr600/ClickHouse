@@ -26,6 +26,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from go_signal import wait_for_go  # noqa: E402
 
 if __name__ == "__main__":
+    if "--pipe-pages" in sys.argv:
+        pages = int(sys.argv[sys.argv.index("--pipe-pages") + 1])
+        fcntl.fcntl(sys.stderr.fileno(), fcntl.F_SETPIPE_SZ, pages * os.sysconf("SC_PAGE_SIZE"))
     size = int(sys.argv[sys.argv.index("--bytes") + 1]) if "--bytes" in sys.argv else 128 * 1024
     marker = sys.argv[sys.argv.index("--marker") + 1] if "--marker" in sys.argv else None
     if marker:
