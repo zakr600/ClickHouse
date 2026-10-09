@@ -29,10 +29,9 @@ namespace DB
   * see `refreshBackingSize`), and it does not stop the command from freeing pages inside it with
   * `fallocate(FALLOC_FL_PUNCH_HOLE)` or `madvise(MADV_REMOVE)`, which the kernel refuses only
   * under `F_SEAL_WRITE` - a seal the command cannot live with, its output goes into the file.
-  * Neither is a `SIGBUS`: a page that was punched out is still inside the file, and the server's
-  * next access to it allocates it afresh, like any other page of memory - which can fail the way
-  * any allocation can (the OOM killer, under a cgroup limit; the mount behind a `memfd` has no
-  * size limit of its own), but not the way an access past the end of a file does. What a punched
+  * A punched-out page remains inside the file, but its next access must allocate it again.
+  * Failure to reserve memory on that fault can raise `SIGBUS`; a cgroup limit can also invoke the
+  * OOM killer. The seals prevent faults caused by truncation, not these allocation failures. What a
   * hole takes away is the reservation: the pages were committed up front so that the transport
   * would not allocate on the hot path, and after a hole it does, for that region. There is no
   * putting that back that would mean anything: the command can punch again the instant after,
@@ -44,7 +43,7 @@ namespace DB
   * So the contract is this. The command is the server's own code - configured by the
   * administrator, run as the server's user, able to signal the server - and is trusted like it.
   * Against a command that is merely wrong (the classic one opens the region with `O_TRUNC`), the
-  * seal is a kernel-enforced guarantee: the server cannot be crashed through the region. Against
+  * seal is a kernel-enforced guarantee: the command cannot cause `SIGBUS` by truncating the region. Against
   * a command that means harm, the region's cost is bounded - the consumer never charges, commits
   * or maps it beyond what it checked against its cap - and nothing else is promised: such a
   * command can slow its own function down, answer with zeros, or, for that matter, kill the

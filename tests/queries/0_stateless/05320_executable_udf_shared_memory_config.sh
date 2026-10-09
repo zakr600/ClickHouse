@@ -75,7 +75,7 @@ shm_local "
 
     -- What the transport is configured with is answerable from SQL. A region that may grow reports
     -- the bound it may grow to, not the raw \`0\` the configuration uses for \"it may not\"; a function
-    -- the loader refused has no configuration at all, so its columns are at their defaults.
+    -- the loader refused has no configuration at all, so its scalar configuration columns are NULL.
     SELECT name, load_status, use_shared_memory, shared_memory_size, shared_memory_max_size
     FROM system.user_defined_functions WHERE name IN ('shm_ok', 'shm_grow', 'shm_pool', 'bad_size_no_shm') ORDER BY name;
 "

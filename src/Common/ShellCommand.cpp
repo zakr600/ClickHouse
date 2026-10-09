@@ -422,7 +422,7 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
     }
 
     /// How the child reports a failure of any step below: a close-on-exec pipe. A successful
-    /// `exec` closes the child's end and the parent reads EOF; a failure writes the step and the
+    /// `exec` leaves no report; a failure writes the step and the
     /// `errno` and the parent reads those. The child's copy of the write end is staged above every
     /// target like the descriptors above are, so that no `dup2` below lands on it - it would
     /// otherwise be silently replaced by whatever was installed under that number, and a later
@@ -430,6 +430,11 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
     /// with `O_CLOEXEC`, and `F_DUPFD_CLOEXEC` keeps the copy so.) Both of the parent's write ends
     /// are closed before the parent reads, or the read would never see EOF.
     PipeFDs pipe_child_error;
+    /// Another concurrent spawn can inherit a writer before Darwin installs `FD_CLOEXEC`.
+    /// After `vfork` the report is already available or the child has executed successfully;
+    /// receiving it must not depend on every unrelated copy of the writer being closed.
+    if (::fcntl(pipe_child_error.fds_rw[0], F_SETFL, O_NONBLOCK) == -1)
+        throw ErrnoException(ErrorCodes::CANNOT_FCNTL, "Cannot make the child error pipe non-blocking");
     const int child_error_fd = ::fcntl(pipe_child_error.fds_rw[1], F_DUPFD_CLOEXEC, first_free_fd);
     if (child_error_fd == -1)
         throw ErrnoException(ErrorCodes::CANNOT_FCNTL, "Cannot duplicate the child error pipe");
@@ -523,8 +528,8 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
     }
 
     /// The child has either `exec`ed or written its report and exited (that is what `vfork`
-    /// guarantees by the time it returns in the parent), so this read does not wait on anything:
-    /// once the parent's own write ends are closed, the pipe holds either the report or nothing.
+    /// guarantees by the time it returns in the parent). Read the report without waiting for EOF:
+    /// another process may still hold a copy of the write end.
     {
         if (0 != ::close(child_error_fd))
             LOG_WARNING(getLogger(), "Cannot close the child error pipe: {}", errnoToString());
@@ -545,7 +550,7 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
         /// without the risk of blocking on a child that is alive and well, which a pool worker
         /// would be for as long as it is not asked to exit.
         bool child_reported_failure = bytes_read > 0;
-        if (bytes_read < 0)
+        if (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
         {
             const int read_error = errno;
             int status = 0;
@@ -1180,7 +1185,10 @@ bool ShellCommand::waitDrainingOutput(
             /// least every `exit_wait_step_ms` to check for cancellation and the budget: there is
             /// nothing on the pipes to come back for sooner.
             static constexpr UInt64 exit_wait_step_ms = 100;
-            waitForPidMilliseconds(pid, unbounded ? exit_wait_step_ms : std::min(remaining_ms, exit_wait_step_ms), /*leave_unreaped=*/ true);
+            const auto result = waitForPidMilliseconds(
+                pid, unbounded ? exit_wait_step_ms : std::min(remaining_ms, exit_wait_step_ms), /*leave_unreaped=*/ true);
+            if (result == WaitForPidResult::ERROR)
+                throw Exception(ErrorCodes::CANNOT_WAITPID, "Cannot wait for shell command pid {}", pid);
             continue;
         }
 

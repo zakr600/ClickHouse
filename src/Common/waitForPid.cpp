@@ -28,6 +28,7 @@ namespace DB
 enum PollPidResult
 {
     RESTART,
+    TIMED_OUT,
     FAILED
 };
 
@@ -109,7 +110,8 @@ static PollPidResult pollPid(pid_t pid, int timeout_in_ms)
         /// for `poll`, so polling it waits for nothing, and whether the process is there at all the
         /// caller has just found out (`checkPidExited`). Wait a short step, and let it look again.
         static constexpr int no_pidfd_step_ms = 5;
-        poll(nullptr, 0, std::min(timeout_in_ms, no_pidfd_step_ms));
+        if (poll(nullptr, 0, std::min(timeout_in_ms, no_pidfd_step_ms)) < 0 && errno != EINTR)
+            return PollPidResult::FAILED;
         return PollPidResult::RESTART;
     }
 
@@ -131,10 +133,9 @@ static PollPidResult pollPid(pid_t pid, int timeout_in_ms)
     if (ready < 0 && errno == EINTR)
         return PollPidResult::RESTART;
 
-    /// `ready == 0` is a poll timeout; `ready < 0` (non-EINTR) is a real error.
-    /// Both return FAILED: `waitForPid`'s outer deadline loop treats either as
-    /// "stop waiting" — the timeout is re-evaluated there, not here.
-    if (ready <= 0)
+    if (ready == 0)
+        return PollPidResult::TIMED_OUT;
+    if (ready < 0)
         return PollPidResult::FAILED;
 
     return PollPidResult::RESTART;
@@ -185,7 +186,9 @@ static PollPidResult pollPid(pid_t pid, int timeout_in_ms)
     if (ret < 0 && errno == EINTR)
         return PollPidResult::RESTART;
 
-    if (ret <= 0)
+    if (ret == 0)
+        return PollPidResult::TIMED_OUT;
+    if (ret < 0)
         return PollPidResult::FAILED;
 
     return PollPidResult::RESTART;
@@ -201,7 +204,7 @@ namespace DB
 /// terminated.
 static PollPidResult pollPid(pid_t pid, int timeout_in_ms)
 {
-    PollPidResult result = PollPidResult::FAILED;
+    PollPidResult result = PollPidResult::TIMED_OUT;
     int rc, perr;
     struct ps_prochandle *hdl;
 
@@ -214,8 +217,8 @@ static PollPidResult pollPid(pid_t pid, int timeout_in_ms)
     }
 
     rc = Pstopstatus(hdl, PCWSTOP, timeout_in_ms);
-    if (rc < 0 && errno == ENOENT)
-        result = PollPidResult::RESTART;
+    if (rc < 0)
+        result = errno == ENOENT ? PollPidResult::RESTART : PollPidResult::FAILED;
     if (rc == 0)
     {
         int state = Pstate(hdl);
@@ -283,10 +286,10 @@ static int checkPidExited(pid_t pid, bool leave_unreaped)
 
 bool waitForPid(pid_t pid, size_t timeout_in_seconds, bool leave_unreaped)
 {
-    return waitForPidMilliseconds(pid, timeout_in_seconds * 1000, leave_unreaped);
+    return waitForPidMilliseconds(pid, timeout_in_seconds * 1000, leave_unreaped) == WaitForPidResult::EXITED;
 }
 
-bool waitForPidMilliseconds(pid_t pid, size_t timeout_in_milliseconds, bool leave_unreaped)
+WaitForPidResult waitForPidMilliseconds(pid_t pid, size_t timeout_in_milliseconds, bool leave_unreaped)
 {
     Stopwatch watch;
 
@@ -294,7 +297,8 @@ bool waitForPidMilliseconds(pid_t pid, size_t timeout_in_milliseconds, bool leav
     {
         /// If there is no timeout before signal try to waitpid 1 time without block so we can avoid sending
         /// signal if process is already normally terminated.
-        return checkPidExited(pid, leave_unreaped) == 1;
+        const int exited = checkPidExited(pid, leave_unreaped);
+        return exited == 1 ? WaitForPidResult::EXITED : (exited == 0 ? WaitForPidResult::TIMEOUT : WaitForPidResult::ERROR);
     }
 
     /// If timeout is positive, poll until the process exits or the total wall
@@ -308,18 +312,20 @@ bool waitForPidMilliseconds(pid_t pid, size_t timeout_in_milliseconds, bool leav
     {
         int exited = checkPidExited(pid, leave_unreaped);
         if (exited == 1)
-            return true;
+            return WaitForPidResult::EXITED;
 
         if (exited != 0)
-            return false;
+            return WaitForPidResult::ERROR;
 
         const Int64 remaining_ms = total_timeout_ms - static_cast<Int64>(watch.elapsedMilliseconds());
         if (remaining_ms <= 0)
-            return false;
+            return WaitForPidResult::TIMEOUT;
 
         PollPidResult result = pollPid(pid, static_cast<int>(remaining_ms));
         if (result == PollPidResult::FAILED)
-            return false;
+            return WaitForPidResult::ERROR;
+        if (result == PollPidResult::TIMED_OUT)
+            return WaitForPidResult::TIMEOUT;
     }
 }
 

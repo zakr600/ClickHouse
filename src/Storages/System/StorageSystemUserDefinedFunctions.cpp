@@ -49,60 +49,61 @@ ColumnsDescription StorageSystemUserDefinedFunctions::getColumnsDescription()
             "Time spent loading the UDF, in milliseconds."},
 
         // ===== UDF Configuration Fields (from XML config) =====
-        {"type", std::make_shared<DataTypeEnum8>(
+        {"type", makeNullable(std::make_shared<DataTypeEnum8>(
             DataTypeEnum8::Values{
                 {"executable", 0},
                 {"executable_pool", 1}
-            }),
-            "UDF type: 'executable' (single process) or 'executable_pool' (process pool)."},
-        {"command", std::make_shared<DataTypeString>(),
+            })),
+            "UDF type: `executable` (single process) or `executable_pool` (process pool). "
+            "Scalar configuration fields are `NULL` when no successfully loaded configuration is available."},
+        {"command", makeNullable(std::make_shared<DataTypeString>()),
             "Script or command to execute for this UDF."},
-        {"format", std::make_shared<DataTypeString>(),
+        {"format", makeNullable(std::make_shared<DataTypeString>()),
             "Data format for I/O (e.g., 'TabSeparated', 'JSONEachRow')."},
-        {"return_type", std::make_shared<DataTypeString>(),
+        {"return_type", makeNullable(std::make_shared<DataTypeString>()),
             "Function return type (e.g., 'String', 'UInt64')."},
-        {"return_name", std::make_shared<DataTypeString>(),
+        {"return_name", makeNullable(std::make_shared<DataTypeString>()),
             "Optional return value identifier. Empty if not configured."},
         {"argument_types", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()),
-            "Array of argument types (e.g., ['String', 'UInt64'])."},
+            "Array of argument types (e.g., ['String', 'UInt64']). Empty when no successfully loaded configuration is available."},
         {"argument_names", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()),
-            "Array of argument names. Empty strings for unnamed arguments."},
-        {"max_command_execution_time", std::make_shared<DataTypeUInt64>(),
+            "Array of argument names. Empty strings for unnamed arguments; an empty array when no successfully loaded configuration is available."},
+        {"max_command_execution_time", makeNullable(std::make_shared<DataTypeUInt64>()),
             "Maximum seconds to process a data block. Only for 'executable_pool' type."},
-        {"command_termination_timeout", std::make_shared<DataTypeUInt64>(),
+        {"command_termination_timeout", makeNullable(std::make_shared<DataTypeUInt64>()),
             "Seconds before sending SIGTERM to command process."},
-        {"command_read_timeout", std::make_shared<DataTypeUInt64>(),
+        {"command_read_timeout", makeNullable(std::make_shared<DataTypeUInt64>()),
             "Milliseconds for reading from command stdout."},
-        {"command_write_timeout", std::make_shared<DataTypeUInt64>(),
+        {"command_write_timeout", makeNullable(std::make_shared<DataTypeUInt64>()),
             "Milliseconds for writing to command stdin."},
-        {"pool_size", std::make_shared<DataTypeUInt64>(),
+        {"pool_size", makeNullable(std::make_shared<DataTypeUInt64>()),
             "Number of command process instances. Only for 'executable_pool' type."},
-        {"send_chunk_header", std::make_shared<DataTypeUInt8>(),
+        {"send_chunk_header", makeNullable(std::make_shared<DataTypeUInt8>()),
             "Whether to send row count before each data chunk (boolean)."},
-        {"execute_direct", std::make_shared<DataTypeUInt8>(),
+        {"execute_direct", makeNullable(std::make_shared<DataTypeUInt8>()),
             "Whether to execute command directly (1) or via /bin/bash (0)."},
-        {"lifetime", std::make_shared<DataTypeUInt64>(),
+        {"lifetime", makeNullable(std::make_shared<DataTypeUInt64>()),
             "Reload interval in seconds. 0 means reload is disabled."},
-        {"deterministic", std::make_shared<DataTypeUInt8>(),
+        {"deterministic", makeNullable(std::make_shared<DataTypeUInt8>()),
             "Whether function returns the same result for the same arguments (boolean)."},
-        {"stderr_reaction", std::make_shared<DataTypeString>(),
+        {"stderr_reaction", makeNullable(std::make_shared<DataTypeString>()),
             "What is done with the command's stderr output: 'none', 'log', 'log_first', 'log_last' or 'throw'. "
-            "Empty when the function failed to load."},
-        {"check_exit_code", std::make_shared<DataTypeUInt8>(),
+            "`NULL` when no successfully loaded configuration is available."},
+        {"check_exit_code", makeNullable(std::make_shared<DataTypeUInt8>()),
             "Whether the exit status of the command is held against the query (boolean). A non-zero "
             "exit code fails it. An `executable` command is waited for until it exits; an `executable_pool` "
             "worker that is discarded is waited for up to `command_termination_timeout` seconds, and one "
             "that has not exited by then fails the query and is signalled."},
-        {"use_shared_memory", std::make_shared<DataTypeUInt8>(),
+        {"use_shared_memory", makeNullable(std::make_shared<DataTypeUInt8>()),
             "Whether the data is exchanged with the command through a shared-memory file instead of "
             "the `stdin`/`stdout` pipes (boolean). Linux only: a function that asks for it fails to load "
             "on other platforms."},
-        {"shared_memory_size", std::make_shared<DataTypeUInt64>(),
+        {"shared_memory_size", makeNullable(std::make_shared<DataTypeUInt64>()),
             "Initial size in bytes of the shared-memory region. 0 when `use_shared_memory` is disabled."},
-        {"shared_memory_max_size", std::make_shared<DataTypeUInt64>(),
+        {"shared_memory_max_size", makeNullable(std::make_shared<DataTypeUInt64>()),
             "Size in bytes the shared-memory region may grow to on demand. Equal to `shared_memory_size` "
             "when the region may not grow; 0 when `use_shared_memory` is disabled."},
-        {"command_pipe_capacity", std::make_shared<DataTypeUInt64>(),
+        {"command_pipe_capacity", makeNullable(std::make_shared<DataTypeUInt64>()),
             "Capacity in bytes asked of the pipes to the command. 0 keeps the kernel's default. Linux only: "
             "elsewhere it has no effect."}
     };
@@ -212,13 +213,9 @@ void StorageSystemUserDefinedFunctions::fillData(
         }
         else
         {
-            // Failed to load - configuration unavailable, insert defaults for all config fields
-            // Config fields: type, command, format, return_type, return_name, argument_types, argument_names,
-            // max_command_execution_time, command_termination_timeout, command_read_timeout, command_write_timeout,
-            // pool_size, send_chunk_header, execute_direct, lifetime, deterministic, stderr_reaction,
-            // check_exit_code, use_shared_memory, shared_memory_size, shared_memory_max_size, command_pipe_capacity
-            constexpr size_t config_fields_count = 22;
-            for (size_t j = 0; j < config_fields_count; ++j)
+            /// No loaded configuration: scalar columns are `NULL`, argument arrays are empty.
+            /// In particular, an unknown transport or pool size must not look like a configured zero.
+            while (i < res_columns.size())
                 res_columns[i++]->insertDefault();
         }
     }
