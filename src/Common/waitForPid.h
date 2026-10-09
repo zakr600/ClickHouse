@@ -11,8 +11,15 @@ namespace DB
  */
 bool waitForPid(pid_t pid, size_t timeout_in_seconds, bool leave_unreaped = false);
 
-/// The same, with the timeout in milliseconds.
-bool waitForPidMilliseconds(pid_t pid, size_t timeout_in_milliseconds, bool leave_unreaped = false);
+enum class WaitForPidResult
+{
+    EXITED,
+    TIMEOUT,
+    ERROR,
+};
+
+/// Distinguishes an expired deadline from a failed wait, so a caller cannot retry errors in a busy loop.
+WaitForPidResult waitForPidMilliseconds(pid_t pid, size_t timeout_in_milliseconds, bool leave_unreaped = false);
 
 enum class ChildState
 {

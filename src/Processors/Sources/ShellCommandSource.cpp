@@ -29,6 +29,7 @@
 #include <IO/ReadBufferFromMemory.h>
 
 #include <Common/SharedMemoryRegion.h>
+#include <Common/FailPoint.h>
 #include <Formats/formatBlock.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ProcessList.h>
@@ -71,6 +72,12 @@ namespace ProfileEvents
 
 namespace DB
 {
+
+namespace FailPoints
+{
+    extern const char executable_udf_fail_handback_measurement[];
+}
+
 
 namespace ErrorCodes
 {
@@ -275,6 +282,9 @@ public:
 
     bool nextImpl() override
     {
+        if (stdout_is_done)
+            return false;
+
         size_t bytes_read = 0;
 
         /// One budget for the whole call rather than one per wake-up. `command_read_timeout` says
@@ -312,13 +322,9 @@ public:
 
                 if (res == 0)
                 {
-                    /// EOF on stdout, so the command is done answering - but not necessarily done
-                    /// writing. Take the rest of its stderr off the pipe before returning, whatever
-                    /// the reaction is: a command that writes more than a pipeful after closing its
-                    /// stdout is otherwise left blocked in `write` for good, and the wait that reaps
-                    /// it never finishes. `NONE` drops what it reads, which is all "ignore this
-                    /// output" can mean for a pipe.
-                    drainRemainingStderr();
+                    /// Late diagnostics are handled by `waitDrainingOutput` with the command's
+                    /// termination budget. Repeated EOF probes must not wait for future stderr.
+                    stdout_is_done = true;
                     break;
                 }
 
@@ -685,38 +691,6 @@ private:
         pfds[1].revents = 0;
     }
 
-    /// Takes the rest of the command's stderr off the pipe once its stdout has ended.
-    ///
-    /// Bounded twice over: it stops as soon as the pipe goes quiet for a moment, so an ordinary
-    /// command is not held up, and it stops altogether after `command_read_timeout`, so a command
-    /// that writes to stderr forever after closing its stdout cannot hold the query here for
-    /// longer than one that never answers at all. Whatever is left after that belongs to the
-    /// bounded wait that reaps the child.
-    void drainRemainingStderr()
-    {
-        static constexpr size_t STDERR_DRAIN_POLL_MS = 100;
-
-        /// A budget of its own rather than what is left of the read's: this runs after the command
-        /// has closed its stdout, so the read it belongs to is over, and taking the remainder would
-        /// mean that a read which used up its time leaves the command blocked in `write` - which is
-        /// the one thing this is here to prevent.
-        const UInt64 deadline_ns = readDeadlineNs();
-
-        while (!stderr_is_done)
-        {
-            const size_t remaining_ms = remainingMs(deadline_ns);
-            if (remaining_ms == 0)
-                break;
-
-            pfds[1].revents = 0;
-            const int stderr_events = pollWithTimeout(&pfds[1], 1, std::min(STDERR_DRAIN_POLL_MS, remaining_ms));
-            if (stderr_events <= 0 || pfds[1].revents == 0)
-                break;
-
-            readStderrOnce();
-        }
-    }
-
     [[noreturn]] void throwReadTimeout() const
     {
         throw Exception(ErrorCodes::TIMEOUT_EXCEEDED, "Pipe read timeout exceeded {} milliseconds", timeout_milliseconds);
@@ -782,6 +756,7 @@ private:
     ExternalCommandStderrReaction stderr_reaction;
     UDFProcessSubtreeSampler * sampler;
     bool final_sample_taken = false;
+    bool stdout_is_done = false;
 
     static constexpr size_t BUFFER_SIZE = 4_KiB;
     static constexpr size_t MAX_STDERR_SIZE = 1_MiB;  /// Safety limit for stderr accumulation
@@ -1141,44 +1116,11 @@ public:
             unchargePersistentMemory(persistent_memory_charge);
     }
 
-    /// Called by the borrower once it has finished with the region and is about to drop its own
-    /// (query-level) charge, so that whatever survives the borrow is accounted again. Charges the
-    /// region the holder actually still owns, which may be gone since the start of the borrow
-    /// (a discarded worker drops it) or larger (it may have grown).
-    ///
-    /// A region is sealed against shrinking, so its file can only be longer than the server last
-    /// saw it - after a growth of the server's own, or after the command extended it, which the
-    /// seals do not prevent. The length is re-read here, so that what the server is charged for
-    /// while the worker sits idle is what the file holds at that moment, and a region a command
-    /// extended is charged for from this hand-over on. A pooled region keeps that size for the
-    /// life of the worker.
-    ///
-    /// Never throws: this runs on a cleanup path, and it is an accounting hand-back rather than an
-    /// allocation — the memory is already mapped, refusing the charge would not free anything. A
-    /// failed re-read falls back to the footprint last seen, which is a lower bound.
-    ///
-    /// Never more than `cap` per region, whatever the file says. The borrower has just checked the
-    /// files against `shared_memory_max_size` and discarded a worker over it, but the command is
-    /// alive in between and can extend the file after that check and before this read; what it
-    /// must not be able to do is have the server carry a made-up figure while the worker idles.
-    /// The cap is what the administrator allowed a pooled worker to hold, so it is the most any
-    /// idle worker is ever charged, and the next borrow finds the file over the cap and drops it.
-    void acquireChargeFromBorrower(size_t cap) noexcept
+    /// Restore the idle charge from a footprint measured and capped by the borrower before it
+    /// released the query charge. The borrower discards the worker if that measurement fails.
+    /// This changes accounting for existing memory and must not throw during cleanup.
+    void acquireChargeFromBorrower(size_t bytes) noexcept
     {
-        size_t bytes = 0;
-        if (shared_memory)
-        {
-            try
-            {
-                bytes = std::min(shared_memory->refreshFootprint(), cap);
-            }
-            catch (...)
-            {
-                tryLogCurrentException("ShellCommandHolder", "Cannot re-read the size of a pooled shared-memory region; charging the footprint last seen");
-                bytes = std::min(shared_memory->footprint(), cap);
-            }
-        }
-
         /// A borrow that failed before it took the charge over (`releaseChargeToBorrower`) leaves
         /// the holder still charging the region, so the charge is brought to the new figure rather
         /// than added on top of what is there.
@@ -3272,7 +3214,7 @@ namespace
         /// file, not from punching holes in it) are not committed again here: nothing about that
         /// would hold - the command keeps its descriptor and can punch again at any instant - and
         /// `SharedMemoryRegion` explains why no check can even tell. A hole costs the server a page
-        /// allocation on its next access, which is that function's own slowness, and nothing more.
+        /// allocation on its next access, which can raise `SIGBUS` if the kernel cannot reserve memory.
         void takeOverReusedRegion(size_t charged_size)
         {
             auto & region = *shared_memory_region;
@@ -3384,32 +3326,41 @@ namespace
                 auto & region = *shared_memory_region;
 
                 /// The region is clear from here on, whatever happens below. The charge is brought
-                /// up to what the commit makes the file hold - may throw the memory limit, and then
-                /// the pages are left to be allocated on use, and the region is still recorded as
-                /// the previous borrower's, to be cleared again by the next borrow of a different
-                /// one. The charge is settled against the footprint re-read after the commit, and
+                /// up to what the commit makes the file hold. Any failure discards the worker and
+                /// its region while the query still owns the charge. The charge is settled against
+                /// the footprint re-read after the commit, and
                 /// a commit that took the footprint past the cap is a region the command made over
                 /// the cap: the borrow fails closed, with the worker and its region.
-                const size_t charged_before = query_memory_charge;
-                const size_t past_the_length = region.releasePagesUpToLength();
-                const size_t charged = std::max(charged_before, SharedMemoryRegion::roundUpToPages(region.backingSize()) + past_the_length);
-                if (charged > charged_before)
-                    chargeQueryMemory(charged - charged_before);
+                try
+                {
+                    const size_t charged_before = query_memory_charge;
+                    const size_t past_the_length = region.releasePagesUpToLength();
+                    const size_t charged = std::max(charged_before, SharedMemoryRegion::roundUpToPages(region.backingSize()) + past_the_length);
+                    if (charged > charged_before)
+                        chargeQueryMemory(charged - charged_before);
 
-                region.recommitUpToLength();
-                ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryScrubbedBytes, region.size());
+                    region.recommitUpToLength();
+                    ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryScrubbedBytes, region.size());
 
-                const size_t footprint_after = region.refreshFootprint();
-                if (region.isOverTheCap(shared_memory_max_size))
-                    failBorrowOnRegionOverTheCap(std::max(region.backingSize(), region.costOnceMappedWhole()));
+                    const size_t footprint_after = region.refreshFootprint();
+                    if (region.isOverTheCap(shared_memory_max_size))
+                        failBorrowOnRegionOverTheCap(std::max(region.backingSize(), region.costOnceMappedWhole()));
 
-                /// Never below what the borrow was charged before the scrub: that charge was made
-                /// for the region as it was handed over.
-                const size_t settled = std::max(charged_before, footprint_after);
-                if (settled < charged)
-                    unchargeQueryMemory(charged - settled);
-                else if (settled > charged)
-                    chargeQueryMemory(settled - charged);
+                    /// Never below what the borrow was charged before the scrub: that charge was made
+                    /// for the region as it was handed over.
+                    const size_t settled = std::max(charged_before, footprint_after);
+                    if (settled < charged)
+                        unchargeQueryMemory(charged - settled);
+                    else if (settled > charged)
+                        chargeQueryMemory(settled - charged);
+                }
+                catch (...)
+                {
+                    /// Clearing has already changed the region, even if recommitting failed.
+                    /// Do not let constructor cleanup mistake it for an untouched worker.
+                    dropRegionAndWorker();
+                    throw;
+                }
             }
             command_holder->recordBorrower(std::move(borrower));
         }
@@ -3915,6 +3866,29 @@ namespace
                 region_created_by_this_borrow = false;
             }
 
+            /// Measure before releasing the query charge. An unknown footprint disqualifies
+            /// both an active worker and one still held after a failed constructor.
+            size_t persistent_bytes = 0;
+            if (command_holder)
+            {
+                try
+                {
+                    fiu_do_on(FailPoints::executable_udf_fail_handback_measurement,
+                    {
+                        throw Exception(ErrorCodes::CANNOT_READ_FROM_FILE_DESCRIPTOR, "Injected shared-memory footprint measurement failure");
+                    });
+                    persistent_bytes = std::min(command_holder->getSharedMemorySize(), shared_memory_max_footprint);
+                }
+                catch (...)
+                {
+                    tryLogCurrentException("ShellCommandSharedMemorySource", "Cannot measure the pooled region; discarding its worker");
+                    keep_command = false;
+                    closeStdinNoThrow(/*command_is_reused=*/ false);
+                    command = nullptr;
+                    dropRegionAndWorker();
+                }
+            }
+
             /// A non-pooled command and its region go before the charge for the region does, by the
             /// same rule as a discarded pooled worker above: `~ShellCommand` can wait up to
             /// `command_termination_timeout` for a command that was not waited for (`check_exit_code`
@@ -3939,7 +3913,7 @@ namespace
             /// would inflate the peak the server reports. The borrow side of the hand-over
             /// (`releaseChargeToBorrower`) errs the same way, for the same reason.
             if (command_holder)
-                command_holder->acquireChargeFromBorrower(shared_memory_max_footprint);
+                command_holder->acquireChargeFromBorrower(persistent_bytes);
 
             if (command_holder && process_pool)
             {
