@@ -3,14 +3,6 @@
 
 namespace DB
 {
-/*
- * Waits for a specific pid with timeout
- * Returns `true` if process terminated successfully in specified timeout or `false` otherwise
- * With `leave_unreaped`, a child that has exited is left a zombie (`waitid` with `WNOWAIT`), so
- * its pid - and the number of the process group it leads - cannot be reused until it is reaped.
- */
-bool waitForPid(pid_t pid, size_t timeout_in_seconds, bool leave_unreaped = false);
-
 enum class WaitForPidResult
 {
     EXITED,
@@ -18,7 +10,10 @@ enum class WaitForPidResult
     ERROR,
 };
 
-/// Distinguishes an expired deadline from a failed wait, so a caller cannot retry errors in a busy loop.
+/// Waits up to `timeout_in_milliseconds` for the child `pid` to exit, reaping it. Distinguishes an
+/// expired deadline from a failed wait, so a caller cannot retry errors in a busy loop. With
+/// `leave_unreaped`, a child that has exited is left a zombie (`waitid` with `WNOWAIT`), so its pid -
+/// and the number of the process group it leads - cannot be reused until it is reaped.
 WaitForPidResult waitForPidMilliseconds(pid_t pid, size_t timeout_in_milliseconds, bool leave_unreaped = false);
 
 enum class ChildState
@@ -36,6 +31,11 @@ ChildState peekChildState(pid_t pid, bool blocking);
 #if defined(OS_LINUX)
 int syscall_pidfd_open(pid_t pid);
 int syscall_pidfd_send_signal(int pidfd, int sig);
+
+/// `pidfd_open` for a wait on the child `pid`: the descriptor, or -1 with `errno` set. A refusal
+/// (`EPERM`, `EACCES`, `ENOSYS` - a seccomp profile) is not an error for a wait, which then polls in
+/// short steps, but it is logged, once per process, so that the polling has a stated reason.
+int openPidFdForWaiting(pid_t pid);
 #endif
 
 }

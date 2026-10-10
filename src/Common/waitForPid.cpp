@@ -4,8 +4,15 @@
 #include <Common/Stopwatch.h>
 /// for abortOnFailedAssertion() via chassert() (dependency chain looks odd)
 #include <Common/Exception.h>
+#include <Common/logger_useful.h>
 #include <base/defines.h>
+#include <base/errnoToString.h>
 #include <base/scope_guard.h>
+
+#include <algorithm>
+#include <atomic>
+#include <limits>
+#include <mutex>
 
 #include <fcntl.h>
 #include <csignal>
@@ -81,9 +88,51 @@ int syscall_pidfd_send_signal(int pidfd, int sig)
 
 static bool supportsPidFdOpen()
 {
-    VersionNumber pidfd_open_minimal_version(5, 3, 0);
-    VersionNumber linux_version(Poco::Environment::osVersion());
-    return linux_version >= pidfd_open_minimal_version;
+    /// The kernel cannot change under a running process; asked once, not on every step of a wait.
+    static const bool supported = []
+    {
+        VersionNumber pidfd_open_minimal_version(5, 3, 0);
+        VersionNumber linux_version(Poco::Environment::osVersion());
+        return linux_version >= pidfd_open_minimal_version;
+    }();
+    return supported;
+}
+
+int openPidFdForWaiting(pid_t pid)
+{
+    /// A kernel that predates `pidfd_open` is not a refusal, and nothing is reported for it.
+    if (!supportsPidFdOpen())
+    {
+        errno = ENOSYS;
+        return -1;
+    }
+
+    /// A refusal is a policy, not a passing state: once refused, the call is not made again, on
+    /// every step of every wait, only to be refused again.
+    static std::atomic<int> refused_errno{0};
+    if (const int refusal = refused_errno.load(std::memory_order_relaxed))
+    {
+        errno = refusal;
+        return -1;
+    }
+
+    const int fd = syscall_pidfd_open(pid);
+    if (fd < 0 && (errno == EPERM || errno == EACCES || errno == ENOSYS))
+    {
+        const int saved_errno = errno;
+        refused_errno.store(saved_errno, std::memory_order_relaxed);
+        static std::once_flag reported;
+        std::call_once(reported, [saved_errno]
+        {
+            LOG_WARNING(
+                getLogger("waitForPid"),
+                "pidfd_open is refused ({}), most likely by a seccomp profile: waits for child processes are "
+                "done by polling in short steps instead",
+                errnoToString(saved_errno));
+        });
+        errno = saved_errno;
+    }
+    return fd;
 }
 
 /// Without a `pidfd` there is nothing to wait on: a `/proc/<pid>` directory is always ready for
@@ -103,7 +152,7 @@ static PollPidResult pollPid(pid_t pid, int timeout_in_ms)
         return waitStepWithoutPidFd(timeout_in_ms);
 
     // pidfd_open cannot be interrupted, no EINTR handling
-    int pid_fd = syscall_pidfd_open(pid);
+    int pid_fd = openPidFdForWaiting(pid);
 
     if (pid_fd < 0)
     {
@@ -288,11 +337,6 @@ static int checkPidExited(pid_t pid, bool leave_unreaped)
     return waitpid_res == 0 ? 0 : -1;
 }
 
-bool waitForPid(pid_t pid, size_t timeout_in_seconds, bool leave_unreaped)
-{
-    return waitForPidMilliseconds(pid, timeout_in_seconds * 1000, leave_unreaped) == WaitForPidResult::EXITED;
-}
-
 WaitForPidResult waitForPidMilliseconds(pid_t pid, size_t timeout_in_milliseconds, bool leave_unreaped)
 {
     Stopwatch watch;
@@ -311,7 +355,6 @@ WaitForPidResult waitForPidMilliseconds(pid_t pid, size_t timeout_in_millisecond
     /// that a `pollPid` that returns early - a signal, or the short steps it
     /// takes without a `pidfd` - still subtracts real elapsed time.
 
-    const Int64 total_timeout_ms = static_cast<Int64>(timeout_in_milliseconds);
     while (true)
     {
         int exited = checkPidExited(pid, leave_unreaped);
@@ -321,15 +364,16 @@ WaitForPidResult waitForPidMilliseconds(pid_t pid, size_t timeout_in_millisecond
         if (exited != 0)
             return WaitForPidResult::ERROR;
 
-        const Int64 remaining_ms = total_timeout_ms - static_cast<Int64>(watch.elapsedMilliseconds());
-        if (remaining_ms <= 0)
+        const UInt64 elapsed_ms = watch.elapsedMilliseconds();
+        if (elapsed_ms >= timeout_in_milliseconds)
             return WaitForPidResult::TIMEOUT;
 
-        PollPidResult result = pollPid(pid, static_cast<int>(remaining_ms));
-        if (result == PollPidResult::FAILED)
+        /// `poll` takes an `int`: a budget longer than that is waited out in steps of it, and a step
+        /// that times out only sends the loop back to the deadline check above.
+        const UInt64 remaining_ms = timeout_in_milliseconds - elapsed_ms;
+        const int step_ms = static_cast<int>(std::min<UInt64>(remaining_ms, std::numeric_limits<int>::max()));
+        if (pollPid(pid, step_ms) == PollPidResult::FAILED)
             return WaitForPidResult::ERROR;
-        if (result == PollPidResult::TIMED_OUT)
-            return WaitForPidResult::TIMEOUT;
     }
 }
 

@@ -40,6 +40,14 @@ TEST(BorrowedObjectPool, FactoryExceptionDoesNotConsumeCapacity)
     EXPECT_EQ(pool.borrowedObjectsSize(), 0);
 }
 
+/// The one way into `BorrowedObjectPool::waitingBorrowersSize`, which is private: it exists for this
+/// test, not for the pool's users.
+struct BorrowedObjectPoolTestAccess
+{
+    template <typename Pool>
+    static size_t waitingBorrowersSize(const Pool & pool) { return pool.waitingBorrowersSize(); }
+};
+
 namespace
 {
 
@@ -63,7 +71,7 @@ template <typename Pool>
 {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(BORROW_TIMEOUT_MS);
 
-    while (pool.waitingBorrowersSize() < count)
+    while (BorrowedObjectPoolTestAccess::waitingBorrowersSize(pool) < count)
     {
         if (std::chrono::steady_clock::now() > deadline)
             return false;

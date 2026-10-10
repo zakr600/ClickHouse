@@ -494,6 +494,14 @@ public:
         return state;
     }
 
+    /// The same read as `consumePendingStderr`, without putting what it finds through the reaction.
+    /// For a caller that has to clear the pipe of somebody else's output - see
+    /// `discardStderrLeftByAPreviousBorrow`.
+    String consumePendingStderrWithoutReaction() const
+    {
+        return readPendingStderr();
+    }
+
     /// Reads whatever is sitting unread on stderr right now, so a caller that is about to throw the
     /// command away can report it. Best-effort and non-blocking - the descriptor is in non-blocking
     /// mode and nothing here waits for more - and capped, because the amount a broken command can
@@ -508,13 +516,6 @@ public:
     /// Deliberately not `noexcept`: it builds a string, and an allocation on this teardown path can
     /// be refused by the memory tracker. That has to reach the caller's handler, which gives up on
     /// the diagnostic, rather than terminate the server over it.
-    /// The same read, without putting what it finds through the reaction. For a caller that has to
-    /// clear the pipe of somebody else's output - see `discardStderrLeftByAPreviousBorrow`.
-    String consumePendingStderrWithoutReaction() const
-    {
-        return readPendingStderr();
-    }
-
     String consumePendingStderr()
     {
         String result = readPendingStderr();
@@ -756,7 +757,20 @@ private:
         while (res < 0 && errno == EINTR);
 
         if (res < 0)
+        {
+            /// Answered as an error on the pipe, which every caller takes for a worker not to be
+            /// built on - but said here for what it is, or the discard would be reported as a
+            /// worker that exited.
+            const int saved_errno = errno;
+            try
+            {
+                LOG_WARNING(getLogger("TimeoutReadBufferFromFileDescriptor"), "Cannot poll the pipe {} of a command: {}", fd, errnoToString(saved_errno));
+            }
+            catch (...) // NOLINT(bugprone-empty-catch) Ok: a log line that cannot be written must not fail a noexcept probe
+            {
+            }
             return POLLERR;
+        }
 
         return static_cast<Int16>(pfd.revents);
     }
@@ -840,9 +854,6 @@ private:
     UDFProcessSubtreeSampler * sampler;
 };
 
-/// Whether a pooled process is gone and left nothing behind on its stdout. `POLLHUP` without
-/// `POLLIN` is a write end that is closed and a pipe that is empty; a live worker waiting for its
-/// next request reports neither.
 /// What a pooled process that exited in the pool left on its stderr. It wrote that after the
 /// hand-back probe of the query it last served and before it died, so nobody has read it: the
 /// query is over and the process is about to be replaced. It is reported against the process
@@ -881,6 +892,38 @@ static String readLeftoverStderrOfExitedProcess(const ShellCommand & process)
     return result;
 }
 
+/// The context a command's output is parsed with, for both transports. Header auto-detection could
+/// only cause trouble: a first row taken for a header makes the number of input and output rows
+/// differ. And parallel parsing cannot read exactly `max_block_size` rows from a pipe that has no EOF,
+/// so it is off where a fixed number of rows is read.
+static ContextMutablePtr makeContextForReadingCommandOutput(const ContextPtr & context, bool read_fixed_number_of_rows)
+{
+    auto context_for_reading = Context::createCopy(context);
+    if (read_fixed_number_of_rows)
+        context_for_reading->setSetting("input_format_parallel_parsing", false);
+    context_for_reading->setSetting("input_format_csv_detect_header", false);
+    context_for_reading->setSetting("input_format_tsv_detect_header", false);
+    context_for_reading->setSetting("input_format_custom_detect_header", false);
+    return context_for_reading;
+}
+
+/// Records the end of a pooled borrow in the sampler, for both transports: before the worker is torn
+/// down or handed back, while its `/proc` entries still say what the borrow cost. Best-effort.
+static void recordPooledReleaseNoThrow(UDFProcessSubtreeSampler * sampler, bool is_pooled, const char * log_name) noexcept
+{
+    if (!sampler || !is_pooled)
+        return;
+
+    try
+    {
+        sampler->recordReleased();
+    }
+    catch (...)
+    {
+        tryLogCurrentException(log_name);
+    }
+}
+
 /// For `ShellCommand::waitDrainingOutput`: interrupts the wait for a command once its query is killed.
 static std::function<void()> queryKilledCheck(const ContextPtr & context)
 {
@@ -891,9 +934,82 @@ static std::function<void()> queryKilledCheck(const ContextPtr & context)
     };
 }
 
+/// Whether a pooled process is gone and left nothing behind on its stdout. `POLLHUP` without
+/// `POLLIN` is a write end that is closed and a pipe that is empty; a live worker waiting for its
+/// next request reports neither. A worker that closed its stdout and lives on reads the same: it
+/// is not one to build a borrow on either.
 static bool pooledProcessHasExitedCleanly(const ShellCommand & process)
 {
     return TimeoutReadBufferFromFileDescriptor::pipeHasHungUp(process.out.getFD());
+}
+
+/// What makes a pooled worker that served an earlier borrow unfit to build this one on - found
+/// before anything is sent to it, which is the last point at which it can still be replaced
+/// instead of failing the query that borrowed it, for something that happened before it started.
+///
+/// - It exited while it sat in the pool. Built on, it would fail the query obscurely, on its first
+///   write to a closed stdin.
+/// - It wrote to its stdout after it was handed back, dead or alive. The bytes are an earlier
+///   borrow's, so provably not this one's answer, and nothing would let the query tell them from
+///   its own once it starts reading.
+/// - Under `stderr_reaction` `throw`, it left stderr. The bytes are an earlier borrow's and can be
+///   drained without the reaction, but nothing tells when the command has finished writing them:
+///   one in the middle of a burst writes the rest once room is made, and this query would fail for
+///   a diagnostic it did not cause. Under every other reaction stray stderr only lands in a log line,
+///   and the worker is kept.
+enum class UnfitReusedWorker : uint8_t
+{
+    NONE,
+    EXITED,
+    STRAY_STDOUT,
+    STRAY_STDERR,
+};
+
+static UnfitReusedWorker inspectReusedWorker(const ShellCommand & worker, bool stderr_throws)
+{
+    if (pooledProcessHasExitedCleanly(worker))
+        return UnfitReusedWorker::EXITED;
+    if (TimeoutReadBufferFromFileDescriptor::pipeHasPendingOutput(worker.out.getFD()))
+        return UnfitReusedWorker::STRAY_STDOUT;
+    if (stderr_throws && TimeoutReadBufferFromFileDescriptor::pipeHasPendingOutput(worker.err.getFD()))
+        return UnfitReusedWorker::STRAY_STDERR;
+    return UnfitReusedWorker::NONE;
+}
+
+/// Logs why a worker `inspectReusedWorker` found unfit is discarded, with what it left on its stderr -
+/// read now, before the process goes with its pipes: nobody else will ever read it. `subject` names
+/// the worker, `with` what goes with it. Can throw (reading, formatting and logging allocate).
+static void reportUnfitReusedWorker(
+    const ShellCommand & worker, UnfitReusedWorker reason, const char * log_name, std::string_view subject, std::string_view with)
+{
+    const String leftover_stderr = readLeftoverStderrOfExitedProcess(worker);
+    const auto log = getLogger(log_name);
+    switch (reason)
+    {
+        case UnfitReusedWorker::NONE:
+            return;
+        case UnfitReusedWorker::EXITED:
+            if (leftover_stderr.empty())
+                LOG_DEBUG(log, "{} (pid {}) exited while it was idle in the pool; it is discarded{} and a replacement is "
+                    "started for this borrow.", subject, worker.getPid(), with);
+            else
+                LOG_WARNING(log, "{} (pid {}) exited while it was idle in the pool, after writing to its stderr; it is "
+                    "discarded{} and a replacement is started for this borrow. Stderr: {}",
+                    subject, worker.getPid(), with, leftover_stderr);
+            return;
+        case UnfitReusedWorker::STRAY_STDOUT:
+            LOG_WARNING(log, "{} (pid {}) had unread output on its stdout when it was borrowed, so it wrote after the "
+                "response of an earlier invocation; it is discarded{} and a replacement is started for this borrow. The "
+                "command must write nothing past its answer.{}{}",
+                subject, worker.getPid(), with, leftover_stderr.empty() ? "" : " Stderr: ", leftover_stderr);
+            return;
+        case UnfitReusedWorker::STRAY_STDERR:
+            LOG_WARNING(log, "{} (pid {}) had unread output on its stderr when it was borrowed under stderr_reaction "
+                "'throw', so it wrote after the response of an earlier invocation and may still be writing; it is "
+                "discarded{} and a replacement is started for this borrow. Stderr: {}",
+                subject, worker.getPid(), with, leftover_stderr);
+            return;
+    }
 }
 
 class ShellCommandHolder
@@ -1030,11 +1146,6 @@ public:
     size_t getSharedMemorySize() const
     {
         return shared_memory ? shared_memory->refreshFootprint() : 0;
-    }
-
-    void growSharedMemory(size_t new_size)
-    {
-        shared_memory->grow(new_size);
     }
 
     void resetSharedMemory()
@@ -1193,8 +1304,7 @@ namespace
             const ShellCommandSourceConfiguration & configuration_ = {},
             std::unique_ptr<ShellCommandHolder> && command_holder_ = nullptr,
             std::shared_ptr<ProcessPool> process_pool_ = nullptr,
-            bool worker_is_reused_ = false,
-            bool is_user_defined_function_ = false)
+            bool worker_is_reused_ = false)
             : ISource(std::make_shared<const Block>(sample_block_->cloneEmpty()))
             , context(context_)
             , format(format_)
@@ -1206,7 +1316,6 @@ namespace
             , process_pool(process_pool_)
             , check_exit_code(check_exit_code_)
             , worker_is_reused(worker_is_reused_)
-            , is_user_defined_function(is_user_defined_function_)
             , command(std::move(command_))
             , command_holder(std::move(command_holder_))
         {
@@ -1217,24 +1326,15 @@ namespace
             /// the context and changing its settings can throw - MEMORY_LIMIT_EXCEEDED, say.
             try
             {
-                auto context_for_reading = Context::createCopy(context);
-                /// Currently parallel parsing input format cannot read exactly max_block_size rows from input,
-                /// so it will be blocked on ReadBufferFromFileDescriptor because this file descriptor represent pipe that does not have eof.
-                if (configuration.read_fixed_number_of_rows)
-                    context_for_reading->setSetting("input_format_parallel_parsing", false);
-                /// Here header auto detection can only cause troubles, since if it
-                /// will find "header" the number of input and output rows will not
-                /// match.
-                context_for_reading->setSetting("input_format_csv_detect_header", false);
-                context_for_reading->setSetting("input_format_tsv_detect_header", false);
-                context_for_reading->setSetting("input_format_custom_detect_header", false);
-                context = context_for_reading;
+                context = makeContextForReadingCommandOutput(context, configuration.read_fixed_number_of_rows);
 
                 /// Before anything is sent to a worker that has served somebody else.
                 quarantineReusedWorker();
 
                 auto thread_group = CurrentThread::getGroup();
 
+                /// From here on requests reach the worker.
+                sending_started = true;
                 for (auto && send_data_task : send_data_tasks)
                 {
                     send_data_threads.emplace_back([thread_group, task = std::move(send_data_task), this]() mutable
@@ -1279,6 +1379,29 @@ namespace
             }
             catch (...)
             {
+                /// A failure before the send threads were started - copying the context, an
+                /// allocation past the memory limit - reached nothing of the worker: no request was
+                /// sent, so it is at the boundary it was borrowed at and goes back to the pool as it
+                /// is, rather than being killed and replaced over something that was not its doing.
+                /// One that `quarantineReusedWorker` found unfit is marked invalid and goes.
+                worker_untouched = !sending_started && !command_is_invalid && command != nullptr;
+
+                /// Handed back as it was borrowed: `createPipe` made its stdin non-blocking for the
+                /// send tasks, and it is the send task that makes it blocking again (`reset`). A
+                /// worker whose stdin cannot be restored is not handed back.
+                if (worker_untouched)
+                {
+                    try
+                    {
+                        makeFdBlocking(command->in.getFD());
+                    }
+                    catch (...)
+                    {
+                        worker_untouched = false;
+                        tryLogCurrentException("ShellCommandSource");
+                    }
+                }
+
                 /// A failure of the teardown itself must not replace the failure that got us here,
                 /// and must not skip handing the borrowed worker back to the pool.
                 try
@@ -1376,7 +1499,12 @@ namespace
             }
 
             if (command_is_invalid)
+            {
+                /// A pooled worker is not waited for by anyone past this point either - see below.
+                if (command && process_pool)
+                    command->discardWithoutGrace();
                 command = nullptr;
+            }
 
             if (command_holder && process_pool)
             {
@@ -1385,6 +1513,10 @@ namespace
                 if (command && valid_command)
                     valid_command = pipeWorkerIsAtACleanBoundary();
 
+                /// See the constructor: nothing was sent to it.
+                if (worker_untouched)
+                    valid_command = true;
+
                 if (command && valid_command)
                     command_holder->returnCommand(std::move(command));
 
@@ -1392,11 +1524,16 @@ namespace
                 /// query waiting for that slot starts a replacement at once, so leaving this process
                 /// to be destroyed later - with a `command_termination_timeout` wait in front of it -
                 /// lets the pool run over `pool_size` for as long as that takes. Its inputs are
-                /// closed first, so that a worker written to exit on EOF is already on its way out
-                /// when the destructor waits for it, instead of sitting out that whole timeout and
-                /// being signalled. The send threads were joined at the top of this function.
+                /// closed first; the send threads were joined at the top of this function.
                 if (command)
+                {
                     closeCommandInputsNoThrow();
+                    /// Nobody waits for its exit status past this point - `prepare` has done that
+                    /// where it was wanted - so it is killed and reaped at once, rather than holding
+                    /// this query and the pool's slot for its grace period, or being signalled and
+                    /// left a zombie.
+                    command->discardWithoutGrace();
+                }
 
                 command = nullptr;
 
@@ -1455,7 +1592,7 @@ namespace
                 /// leaves the source, so that the exception marks the command invalid and a
                 /// pooled worker is discarded instead of being returned as if it had answered
                 /// correctly - which is what counting the rows further up the pipeline would do.
-                if (is_user_defined_function && configuration.read_fixed_number_of_rows
+                if (configuration.is_user_defined_function && configuration.read_fixed_number_of_rows
                     && current_read_rows + chunk.getNumRows() > configuration.number_of_rows_to_read)
                     throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
                         "Executable UDF wrong result, expected {} row(s), but the command produced more (at least {})",
@@ -1574,8 +1711,9 @@ namespace
                     ///
                     /// Every input, not only `stdin`: a command given several input queries reads
                     /// the rest from the extra descriptors, and one written to exit when its inputs
-                    /// are done waits for EOF on all of them.
-                    command->closeInputs();
+                    /// are done waits for EOF on all of them. Closed inside the `try` below, after the
+                    /// reader has stopped: closing flushes, and a failure there is a failure of this
+                    /// wait like any other, reported with what the command said on stderr.
 
                     /// Stop reading the child's stdout before this wait touches the same descriptor.
                     /// The source can be finished from above - a `LIMIT` downstream closes the
@@ -1588,6 +1726,8 @@ namespace
 
                     try
                     {
+                        command->closeInputs();
+
                         /// `waitDrainingOutput` rather than `wait`: the command may still be
                         /// writing. Reading its stdout stops at the row count this source asked
                         /// for, and stderr is only drained until it goes quiet, so a command that
@@ -1622,12 +1762,13 @@ namespace
                         /// query is killed - as the blocking `wait` did, which could not be killed.
                         const bool output_abandoned = !finished
                             && (!configuration.read_fixed_number_of_rows || current_read_rows < configuration.number_of_rows_to_read);
-                        const bool reaped = command->waitDrainingOutput(
-                            [this](std::string_view str) { timeout_command_out.consumeStderrBytes(str); },
-                            check_exit_code,
-                            /*unbounded_status_wait=*/ !process_pool,
-                            /*limit_stdout_drain=*/ output_abandoned,
-                            queryKilledCheck(context));
+                        const bool reaped = command->waitDrainingOutput({
+                            .stderr_sink = [this](std::string_view str) { timeout_command_out.consumeStderrBytes(str); },
+                            .check_exit_status = check_exit_code,
+                            .unbounded_status_wait = !process_pool,
+                            .limit_stdout_drain = output_abandoned,
+                            .check_cancelled = queryKilledCheck(context),
+                        });
 
                         /// A status that could not be read is not a passing status, and that holds
                         /// however little time the command was given. Pooled workers are waited for
@@ -1715,12 +1856,13 @@ namespace
 
             try
             {
-                const bool reaped = command->waitDrainingOutput(
-                    [this](std::string_view str) { timeout_command_out.consumeStderrBytes(str); },
-                    /*check_exit_status=*/ true,
-                    /*unbounded_status_wait=*/ false,
-                    /*limit_stdout_drain=*/ false,
-                    queryKilledCheck(context));
+                const bool reaped = command->waitDrainingOutput({
+                    .stderr_sink = [this](std::string_view str) { timeout_command_out.consumeStderrBytes(str); },
+                    .check_exit_status = true,
+                    .unbounded_status_wait = false,
+                    .limit_stdout_drain = false,
+                    .check_cancelled = queryKilledCheck(context),
+                });
 
                 /// The same rule as the wait in `prepare` that discards a worker: a status that could
                 /// not be read within `command_termination_timeout` is not a passing status. A worker
@@ -1960,17 +2102,7 @@ namespace
         /// than losing the measurement.
         void recordPooledResourceUsageNoThrow() noexcept
         {
-            if (!configuration.sampler || !process_pool)
-                return;
-
-            try
-            {
-                configuration.sampler->recordReleased();
-            }
-            catch (...)
-            {
-                tryLogCurrentException("ShellCommandSource");
-            }
+            recordPooledReleaseNoThrow(configuration.sampler.get(), process_pool != nullptr, "ShellCommandSource");
         }
 
         ContextPtr context;
@@ -2001,11 +2133,11 @@ namespace
         /// left something on its pipes. A freshly started one cannot have.
         bool worker_is_reused = false;
 
-        /// Whether this source serves an executable UDF, whose protocol is one row per input row:
-        /// only there is a command that answers with more rows than it was sent wrong. The
-        /// `executable_pool` dictionary source and the `ExecutablePool` table engine have always
-        /// taken a block with more rows than they asked for as it is.
-        bool is_user_defined_function = false;
+        /// Whether the send threads have been started, so that requests may have reached the worker.
+        bool sending_started = false;
+
+        /// Set when the constructor fails before anything was sent to the worker - see there.
+        bool worker_untouched = false;
 
         /// Taken over after every other member, because every other member has to be able to throw
         /// without costing a healthy pooled worker: until this object owns these two they still
@@ -2192,9 +2324,9 @@ namespace
                 /// idle in the pool. It is never held by both trackers at once, and by neither only
                 /// for the moment of a hand-over - see `ShellCommandHolder::releaseChargeToBorrower`
                 /// and `cleanup`. The hand-over happens only right
-                /// before the query is charged: the checks below may discard the worker, destroying
-                /// it can take up to `command_termination_timeout`, and its region stays resident
-                /// until then, so it stays charged globally until `discardWorkerAndRegion` drops it.
+                /// before the query is charged: the checks below may discard the worker, its region
+                /// stays resident until the worker has been killed and reaped, so it stays charged
+                /// globally until `discardWorkerAndRegion` drops it.
 
                 /// Before anything is built on a reused worker, and before its region is taken
                 /// over: what these probes find decides whether the region survives with it.
@@ -2309,15 +2441,7 @@ namespace
                 timeout_command_out = std::make_unique<TimeoutReadBufferFromFileDescriptor>(
                     command->out.getFD(), command->err.getFD(), command_read_timeout_milliseconds, stderr_reaction, configuration_.sampler.get());
 
-                /// Match the pipe-mode reader: disable header auto-detection, otherwise the first row
-                /// of the result could be consumed as a header and the row count would not match.
-                auto context_for_reading = Context::createCopy(context);
-                if (configuration.read_fixed_number_of_rows)
-                    context_for_reading->setSetting("input_format_parallel_parsing", false);
-                context_for_reading->setSetting("input_format_csv_detect_header", false);
-                context_for_reading->setSetting("input_format_tsv_detect_header", false);
-                context_for_reading->setSetting("input_format_custom_detect_header", false);
-                context = context_for_reading;
+                context = makeContextForReadingCommandOutput(context, configuration.read_fixed_number_of_rows);
 
                 timeout_command_in = std::make_unique<TimeoutWriteBufferFromFileDescriptor>(
                     command->in.getFD(), command_write_timeout_milliseconds, configuration_.sampler.get());
@@ -2537,12 +2661,13 @@ namespace
                         /// on the pipe path - would never come.
                         const bool output_abandoned = !finished
                             && (!configuration.read_fixed_number_of_rows || current_read_rows < configuration.number_of_rows_to_read);
-                        const bool reaped = command->waitDrainingOutput(
-                            [this](std::string_view str) { timeout_command_out->consumeStderrBytes(str); },
-                            check_exit_code,
-                            /*unbounded_status_wait=*/ !is_pooled && !output_abandoned,
-                            /*limit_stdout_drain=*/ output_abandoned,
-                            queryKilledCheck(context));
+                        const bool reaped = command->waitDrainingOutput({
+                            .stderr_sink = [this](std::string_view str) { timeout_command_out->consumeStderrBytes(str); },
+                            .check_exit_status = check_exit_code,
+                            .unbounded_status_wait = !is_pooled && !output_abandoned,
+                            .limit_stdout_drain = output_abandoned,
+                            .check_cancelled = queryKilledCheck(context),
+                        });
 
                         /// As on the pipe path: a status that could not be read is not a passing
                         /// status, whatever the budget was. See the note there.
@@ -2849,89 +2974,29 @@ namespace
             if (!worker)
                 return;
 
-            if (pooledProcessHasExitedCleanly(*worker))
-            {
-                discardPooledWorkerBeforeTheBorrow([&]
-                {
-                    /// Whatever it said on its way out is read and reported now, before the process
-                    /// is dropped with its pipes: nobody else will ever read it.
-                    const String leftover_stderr = readLeftoverStderrOfExitedProcess(*worker);
-                    if (leftover_stderr.empty())
-                        LOG_DEBUG(
-                            getLogger("ShellCommandSharedMemorySource"),
-                            "The process of an executable UDF (pid {}) exited while it was idle in the pool; "
-                            "it is discarded, with its region, and a replacement is started for this borrow.",
-                            worker->getPid());
-                    else
-                        LOG_WARNING(
-                            getLogger("ShellCommandSharedMemorySource"),
-                            "The process of an executable UDF (pid {}) exited while it was idle in the pool, "
-                            "after writing to its stderr; it is discarded, with its region, and a replacement is "
-                            "started for this borrow. Stderr: {}",
-                            worker->getPid(),
-                            leftover_stderr);
-                });
+            const auto reason = inspectReusedWorker(*worker, stderr_throws);
+            if (reason == UnfitReusedWorker::NONE)
                 return;
-            }
 
-            if (TimeoutReadBufferFromFileDescriptor::pipeHasPendingOutput(worker->out.getFD()))
-            {
+            if (reason != UnfitReusedWorker::EXITED)
                 ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryDirtyChannelDiscards);
-                discardPooledWorkerBeforeTheBorrow([&]
-                {
-                    const String leftover_stderr = readLeftoverStderrOfExitedProcess(*worker);
-                    LOG_WARNING(
-                        getLogger("ShellCommandSharedMemorySource"),
-                        "The process of an executable UDF (pid {}) had unread output on its stdout when it was "
-                        "borrowed, so it wrote after the response of an earlier invocation; it is discarded, with its "
-                        "region, and a replacement is started for this borrow. The command must write nothing but the "
-                        "response frame.{}{}",
-                        worker->getPid(),
-                        leftover_stderr.empty() ? "" : " Stderr: ",
-                        leftover_stderr);
-                });
-                return;
-            }
 
-            /// Under `throw`, stderr found here goes as well. It is an earlier borrow's, and it can
-            /// be taken off the pipe without the reaction (`discardStderrLeftByAPreviousBorrow`) -
-            /// but nothing tells when the command has finished writing it. A command in the middle
-            /// of a burst, blocked in `write` on a full pipe, writes the rest once room is made,
-            /// and how soon depends on when the kernel schedules it: on a loaded machine that comes
-            /// after any drain of a fixed length, in the middle of this borrow's request, and the
-            /// query fails for a diagnostic it did not cause. A worker that is not at a known
-            /// boundary is not built on, so it is discarded with its region. Under every other
-            /// reaction stray stderr only lands in a log line, and the worker is kept.
-            if (!stderr_throws || !TimeoutReadBufferFromFileDescriptor::pipeHasPendingOutput(worker->err.getFD()))
-                return;
-
-            /// A worker blocked writing its stderr does not wait out the termination timeout either:
-            /// the destructor closes the read end of the pipe before it waits, and the blocked
-            /// `write` fails.
-            ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryDirtyChannelDiscards);
             discardPooledWorkerBeforeTheBorrow([&]
             {
-                const String leftover_stderr = readLeftoverStderrOfExitedProcess(*worker);
-                LOG_WARNING(
-                    getLogger("ShellCommandSharedMemorySource"),
-                    "The process of an executable UDF (pid {}) had unread output on its stderr when it was "
-                    "borrowed under stderr_reaction 'throw', so it wrote after the response of an earlier invocation "
-                    "and may still be writing; it is discarded, with its region, and a replacement is started for "
-                    "this borrow. Stderr: {}",
-                    worker->getPid(),
-                    leftover_stderr);
+                reportUnfitReusedWorker(
+                    *worker, reason, "ShellCommandSharedMemorySource", "The process of an executable UDF", ", with its region,");
             });
         }
 
         /// Drops a worker `inspectPooledWorkerBeforeTheBorrow` found unfit, together with its region,
         /// after `report` - which reads what the worker left on its pipes and logs it, so it needs the
-        /// worker alive. (`~ShellCommand` closes the worker's inputs before it waits for it, so a
-        /// process written to exit on EOF does so at once.) The decision is already made, and the
-        /// worker has to go whatever happens on the way: the report can throw (reading, formatting
-        /// and logging allocate - `MEMORY_LIMIT_EXCEEDED`), and a holder still holding the process
-        /// would hand it back to the pool when the constructor unwinds, for the next borrow to be
-        /// built on the worker that was found unfit. So the discard runs on every path, and the
-        /// exception goes on after it.
+        /// worker alive. The worker is then killed and reaped at once, without the grace period
+        /// (`ShellCommand::discardWithoutGrace`): nobody is interested in how it exits. The decision
+        /// is already made, and the worker has to go whatever happens on the way: the report can
+        /// throw (reading, formatting and logging allocate - `MEMORY_LIMIT_EXCEEDED`), and a holder
+        /// still holding the process would hand it back to the pool when the constructor unwinds, for
+        /// the next borrow to be built on the worker that was found unfit. So the discard runs on
+        /// every path, and the exception goes on after it.
         template <typename Report>
         void discardPooledWorkerBeforeTheBorrow(Report && report)
         {
@@ -3127,10 +3192,8 @@ namespace
             size_t added = 0;
             try
             {
-                if (command_holder)
-                    command_holder->growSharedMemory(new_size);
-                else
-                    region.grow(new_size);
+                /// The holder's region and this borrow's are one object (`getOrCreateSharedMemory`).
+                region.grow(new_size);
             }
             catch (...)
             {
@@ -3337,7 +3400,7 @@ namespace
                         chargeQueryMemory(charged - charged_before);
 
                     region.recommitUpToLength();
-                    ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryScrubbedBytes, region.size());
+                    ProfileEvents::increment(ProfileEvents::ExecutableUDFSharedMemoryScrubbedBytes, region.backingSize());
 
                     const size_t footprint_after = region.refreshFootprint();
                     if (region.isOverTheCap(shared_memory_max_size))
@@ -3596,15 +3659,26 @@ namespace
         }
 
         /// Not `const` for the same reason as `controlChannelIsClean`, which it asks.
+        /// Asked by `prepare` and again by `cleanup`. A "no" is final: `prepare` acts on it - closes
+        /// the worker's stdin, waits for it - and a later "yes" from a probe that happens to pass
+        /// would hand that worker back to the pool. A "yes" can still turn into a "no": discarding
+        /// is the safe direction. A worker whose stdin is closed cannot take a request either way.
         bool commandIsReused()
         {
-            return is_pooled
+            if (reuse_ruled_out)
+                return false;
+
+            const bool reused = is_pooled
                 && command != nullptr
                 && !command_is_invalid
+                && !stdin_closed
                 && (command_can_be_reused
                     || (configuration.read_fixed_number_of_rows && current_read_rows >= configuration.number_of_rows_to_read))
                 && controlChannelIsClean()
                 && regionIsWithinTheCap();
+
+            reuse_ruled_out = !reused;
+            return reused;
         }
 
 
@@ -3670,17 +3744,7 @@ namespace
         /// than losing the measurement.
         void recordPooledResourceUsageNoThrow() noexcept
         {
-            if (!configuration.sampler || !process_pool)
-                return;
-
-            try
-            {
-                configuration.sampler->recordReleased();
-            }
-            catch (...)
-            {
-                tryLogCurrentException("ShellCommandSharedMemorySource");
-            }
+            recordPooledReleaseNoThrow(configuration.sampler.get(), process_pool != nullptr, "ShellCommandSharedMemorySource");
         }
 
         /// Same, for the teardown paths (cancellation, cleanup) where an exception must not escape.
@@ -3808,8 +3872,10 @@ namespace
                     /// borrow, instead of leaving the region and its persistent memory charge
                     /// pinned on the reused holder for a replacement process - which could not use
                     /// them anyway, since it is the process that inherits a region's descriptor at
-                    /// `exec`, and a replacement gets its own. resetSharedMemory drops the holder's
-                    /// reference (the region dies with the last one, below) and uncharges memory.
+                    /// `exec`, and a replacement gets its own. `resetSharedMemory` only drops the
+                    /// holder's reference (the region dies with the last one, below). The charge for
+                    /// the region is this borrow's (`releaseChargeToBorrower`) and is released below,
+                    /// and a holder left without a region takes none back (`acquireChargeFromBorrower`).
                     ///
                     /// The process goes first, before those references and the accounting that
                     /// goes with them. Its stdin was closed above, so this is where a worker
@@ -3973,13 +4039,16 @@ namespace
         size_t current_read_rows = 0;
         bool stdin_closed = false;
 
-        /// Set by `controlChannelIsClean`, which is const because it only answers a question;
-        /// reported and cleared by `reportDirtyChannelDiscard`. `channel_was_dirty` is the latch and
-        /// is never cleared - see `controlChannelIsClean` for why the answer must not be re-derived.
-        mutable bool channel_was_dirty = false;
-        mutable bool dirty_stdout = false;
-        mutable bool dirty_stderr = false;
-        mutable bool child_is_gone = false;
+        /// Set by `controlChannelIsClean` - which is not a mere question: it drains stderr and
+        /// latches its answer - and reported and cleared by `reportDirtyChannelDiscard`.
+        /// `channel_was_dirty` is the latch and is never cleared - see `controlChannelIsClean` for
+        /// why the answer must not be re-derived.
+        bool channel_was_dirty = false;
+        /// Latched by `commandIsReused`, see there.
+        bool reuse_ruled_out = false;
+        bool dirty_stdout = false;
+        bool dirty_stderr = false;
+        bool child_is_gone = false;
 
         std::shared_ptr<ProcessPool> process_pool;
 
@@ -4040,8 +4109,13 @@ Pipe ShellCommandSourceCoordinator::createPipe(
     std::vector<Pipe> && input_pipes,
     Block sample_block,
     ContextPtr context,
-    const ShellCommandSourceConfiguration & source_configuration)
+    const ShellCommandSourceConfiguration & source_configuration_)
 {
+    /// Whether the source serves a UDF is the coordinator's to say - it already knows, and a caller
+    /// that forgot to say so would lose the UDF-only checks without a sound.
+    ShellCommandSourceConfiguration source_configuration = source_configuration_;
+    source_configuration.is_user_defined_function = configuration.is_user_defined_function;
+
     if (configuration.use_shared_memory && input_pipes.size() != 1)
         throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
             "Shared-memory mode supports exactly one input pipe, got {}", input_pipes.size());
@@ -4113,7 +4187,12 @@ Pipe ShellCommandSourceCoordinator::createPipe(
         bool result = process_pool->tryBorrowObject(
             process_holder,
             [build_process]() { return std::make_unique<ShellCommandHolder>(ShellCommandHolder::ShellCommandBuilderFunc(build_process)); },
-            configuration.max_command_execution_time_seconds * 1000);
+            /// Saturated rather than wrapped: a huge `max_command_execution_time`, meant as "wait
+            /// forever", must not come out as a fraction of a second. The pool saturates the
+            /// deadline it computes from this in turn.
+            configuration.max_command_execution_time_seconds > std::numeric_limits<size_t>::max() / 1000
+                ? std::numeric_limits<size_t>::max()
+                : configuration.max_command_execution_time_seconds * 1000);
 
         /// Pool wait is frozen here on both the success and the timeout-failure
         /// paths so that `PoolWaitMicroseconds` always records contention for a
@@ -4162,84 +4241,38 @@ Pipe ShellCommandSourceCoordinator::createPipe(
         worker_is_reused = process_holder->hasReturnedCommand();
         process = process_holder->buildCommand();
 
-        /// A worker that exited while it sat in the pool is replaced here, before anything is built
-        /// on it. This is the last point at which a replacement is still possible: once the source
-        /// owns the process, the only thing it can do about a dead one is fail the query that
-        /// happened to borrow it - and that query would fail obscurely, on its first write to a
-        /// closed stdin, for something that happened before it started.
-        if (worker_is_reused && pooledProcessHasExitedCleanly(*process))
+        /// Drops a reused worker found unfit below - killed and reaped at once, nobody being
+        /// interested in how it exits (`ShellCommand::discardWithoutGrace`) - after `report`, which
+        /// reads what it left on its pipes and logs it, and starts a fresh one. The worker goes on
+        /// every path: the report can throw (reading, formatting and logging allocate -
+        /// `MEMORY_LIMIT_EXCEEDED`), and a `process` still set would be handed back to the pool by
+        /// the scope guard above, for the next borrow to be built on the worker found unfit.
+        auto replaceUnfitWorker = [&](auto && report)
         {
-            /// Whatever it said on its way out is read and reported now, before the process is
-            /// dropped with its pipes: nobody else will ever read it.
-            const String leftover_stderr = readLeftoverStderrOfExitedProcess(*process);
-            if (leftover_stderr.empty())
-                LOG_DEBUG(
-                    getLogger("ShellCommandSource"),
-                    "The process of a pooled command (pid {}) exited while it was idle in the pool; starting a "
-                    "replacement for this borrow.",
-                    process->getPid());
-            else
-                LOG_WARNING(
-                    getLogger("ShellCommandSource"),
-                    "The process of a pooled command (pid {}) exited while it was idle in the pool, after writing "
-                    "to its stderr; starting a replacement for this borrow. Stderr: {}",
-                    process->getPid(),
-                    leftover_stderr);
-
-            process->discardWithoutGrace();
-            process.reset();
+            {
+                SCOPE_EXIT({
+                    process->discardWithoutGrace();
+                    process.reset();
+                });
+                report();
+            }
             process = process_holder->buildCommand();
             worker_is_reused = false;
-        }
+        };
 
-        /// So is a worker that wrote to its stdout after it was handed back - dead or alive. The
-        /// bytes are an earlier borrow's, and this borrow has not sent anything yet, so they are
-        /// provably not its answer; this transport has no framing that would let the query tell
-        /// them from its own rows once it has started reading, which is exactly why they must not
-        /// be there when it does. Seen here they cost the worker, not the query: it is dropped for
-        /// a fresh one, as on the shared-memory path. A byte that lands between this look and the first request is the one case left, and
-        /// `quarantineReusedWorker` fails the query for it rather than answer it wrongly.
-        if (worker_is_reused && TimeoutReadBufferFromFileDescriptor::pipeHasPendingOutput(process->out.getFD()))
+        /// A reused worker found unfit (`inspectReusedWorker`) is replaced here, before anything is
+        /// built on it - as on the shared-memory path. A byte that lands on its stdout between this
+        /// look and the first request is the one case left, and `quarantineReusedWorker` fails the
+        /// query for it rather than answer it wrongly.
+        if (worker_is_reused)
         {
-            const String leftover_stderr = readLeftoverStderrOfExitedProcess(*process);
-            LOG_WARNING(
-                getLogger("ShellCommandSource"),
-                "The process of a pooled command (pid {}) had unread output on its stdout when it was borrowed, so it "
-                "wrote after the response of an earlier invocation; it is discarded and a replacement is started for "
-                "this borrow. The command must write nothing past the rows it was asked for.{}{}",
-                process->getPid(),
-                leftover_stderr.empty() ? "" : " Stderr: ",
-                leftover_stderr);
-
-            process->discardWithoutGrace();
-            process.reset();
-            process = process_holder->buildCommand();
-            worker_is_reused = false;
-        }
-
-        /// Under `throw`, stderr found here goes as well, for the reason the shared-memory path
-        /// gives (`inspectPooledWorkerBeforeTheBorrow`): the bytes are an earlier borrow's and can
-        /// be drained without the reaction (`quarantineReusedWorker`), but nothing tells when the
-        /// command has finished writing them. A command in the middle of a burst writes the rest
-        /// once room is made, possibly after any drain of a fixed length, and this query would
-        /// fail for a diagnostic it did not cause. Under every other reaction stray stderr only
-        /// lands in a log line, and the worker is kept.
-        if (worker_is_reused && configuration.stderr_reaction == ExternalCommandStderrReaction::THROW
-            && TimeoutReadBufferFromFileDescriptor::pipeHasPendingOutput(process->err.getFD()))
-        {
-            const String leftover_stderr = readLeftoverStderrOfExitedProcess(*process);
-            LOG_WARNING(
-                getLogger("ShellCommandSource"),
-                "The process of a pooled command (pid {}) had unread output on its stderr when it was borrowed under "
-                "stderr_reaction 'throw', so it wrote after the response of an earlier invocation and may still be "
-                "writing; it is discarded and a replacement is started for this borrow. Stderr: {}",
-                process->getPid(),
-                leftover_stderr);
-
-            process->discardWithoutGrace();
-            process.reset();
-            process = process_holder->buildCommand();
-            worker_is_reused = false;
+            const auto reason
+                = inspectReusedWorker(*process, configuration.stderr_reaction == ExternalCommandStderrReaction::THROW);
+            if (reason != UnfitReusedWorker::NONE)
+                replaceUnfitWorker([&]
+                {
+                    reportUnfitReusedWorker(*process, reason, "ShellCommandSource", "The process of a pooled command", "");
+                });
         }
 
         /// Borrow acquired: capture pid for procfs sampling. The pre-snapshot
@@ -4349,8 +4382,7 @@ Pipe ShellCommandSourceCoordinator::createPipe(
         source_configuration,
         std::move(process_holder),
         process_pool,
-        worker_is_reused,
-        configuration.is_user_defined_function);
+        worker_is_reused);
 
     return Pipe(std::move(source));
 }

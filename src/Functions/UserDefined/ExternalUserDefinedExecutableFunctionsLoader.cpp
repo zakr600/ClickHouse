@@ -270,6 +270,11 @@ ExternalLoader::LoadableMutablePtr ExternalUserDefinedExecutableFunctionsLoader:
                 "Executable user defined function {}: `shared_memory_max_size` ({}) must not exceed {}",
                 name, shared_memory_max_size, max_shared_memory_size);
 
+        /// Validate platform support (`memfd_create` with sealing) while loading the function, so
+        /// an unusable platform is rejected once instead of failing every invocation. Before the cap is
+        /// rounded below: the probe is also what tells the unit it is rounded to.
+        SharedMemoryRegion::checkSupported();
+
         /// What gets charged is the footprint, which is measured in whole pages: a cap of
         /// `INT64_MAX` bytes passes the checks above and rounds up to a figure the tracker cannot
         /// represent. So the rounded figure is the one that has to fit.
@@ -279,10 +284,6 @@ ExternalLoader::LoadableMutablePtr ExternalUserDefinedExecutableFunctionsLoader:
                 "Executable user defined function {}: shared-memory charge (up to {} bytes, "
                 "rounded up to whole pages) must not exceed {}",
                 name, shared_memory_max_footprint, max_shared_memory_size);
-
-        /// Validate platform support (`memfd_create` with sealing) while loading the function, so
-        /// an unusable platform is rejected once instead of failing every invocation.
-        SharedMemoryRegion::checkSupported();
     }
     else
     {

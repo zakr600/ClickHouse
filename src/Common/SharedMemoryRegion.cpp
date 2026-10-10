@@ -1,8 +1,11 @@
 #include <Common/SharedMemoryRegion.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <string>
 #include <limits>
 
@@ -96,6 +99,37 @@ void closeNoThrow(int fd, const char * operation) noexcept
     }
 }
 
+/// The largest folio a `memfd` was seen to be backed in (`checkSupported`): a lower bound for the unit
+/// `roundUpToPages` rounds to, whatever `/sys` says. Only ever raised.
+std::atomic<size_t> observed_backing_unit{0};
+
+void observeBackingUnit(size_t bytes)
+{
+    size_t current = observed_backing_unit.load(std::memory_order_relaxed);
+    while (bytes > current && !observed_backing_unit.compare_exchange_weak(current, bytes, std::memory_order_relaxed))
+    {
+    }
+}
+
+/// `posix_fallocate` of the file up to `size`, retried on `EINTR` (see `reserveBackingStorage`).
+/// Returns the error, which `posix_fallocate` returns rather than sets in `errno`; 0 on success.
+int fallocateUpTo(int fd, size_t size)
+{
+    int fallocate_error = 0;
+    do
+        fallocate_error = ::posix_fallocate(fd, 0, static_cast<off_t>(size));
+    while (fallocate_error == EINTR);
+    return fallocate_error;
+}
+
+/// Frees every page of the file, inside its length and past it. 0 on success, -1 with `errno` set.
+int punchWholeFile(int fd)
+{
+    const off_t page_size = static_cast<off_t>(::sysconf(_SC_PAGESIZE));
+    const off_t whole_file = std::numeric_limits<off_t>::max() / page_size * page_size;
+    return ::fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, whole_file);
+}
+
 /// Frees every page of a region's file - inside its length and past it - for whoever still holds
 /// it. A region is dropped when the server is done with it, and that is when its charge is dropped
 /// too; the pages have to go at the same moment, or the charge would be gone while they stay. They
@@ -106,9 +140,7 @@ void closeNoThrow(int fd, const char * operation) noexcept
 /// own, as any of its memory would be.
 void releasePagesNoThrow(int fd) noexcept
 {
-    const off_t page_size = static_cast<off_t>(::sysconf(_SC_PAGESIZE));
-    const off_t whole_file = std::numeric_limits<off_t>::max() / page_size * page_size;
-    if (0 != ::fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, whole_file))
+    if (0 != punchWholeFile(fd))
     {
         const int punch_errno = errno;
         LOG_WARNING(
@@ -149,11 +181,7 @@ void unmapNoThrow(void * data, size_t size, const char * operation) noexcept
 /// the caller's, which charges the memory tracker for the size before asking for it.
 void reserveBackingStorage(int fd, size_t size, const char * operation)
 {
-    int fallocate_error = 0;
-    do
-        fallocate_error = ::posix_fallocate(fd, 0, static_cast<off_t>(size));
-    while (fallocate_error == EINTR);
-
+    const int fallocate_error = fallocateUpTo(fd, size);
     if (fallocate_error != 0)
         ErrnoException::throwWithErrno(
             ErrorCodes::CANNOT_ALLOCATE_MEMORY,
@@ -186,15 +214,38 @@ void SharedMemoryRegion::checkSupported()
     /// too fails at configuration time rather than on every call. Whatever the reason, it is
     /// reported as the transport being unavailable here - this is a probe, and a refusal of one
     /// page is not the machine running out of memory.
-    int fallocate_error = 0;
-    do
-        fallocate_error = ::posix_fallocate(fd, 0, static_cast<off_t>(::sysconf(_SC_PAGESIZE)));
-    while (fallocate_error == EINTR);
+    const int fallocate_error = fallocateUpTo(fd, static_cast<size_t>(::sysconf(_SC_PAGESIZE)));
     if (fallocate_error != 0)
         ErrnoException::throwWithErrno(
             ErrorCodes::NOT_IMPLEMENTED,
             fallocate_error,
             "Shared-memory regions for executable UDFs need posix_fallocate on a memfd, which this system refuses");
+
+    /// Footprints and caps are compared in the unit the kernel backs a `memfd` in (`roundUpToPages`),
+    /// which is read from `/sys/kernel/mm/transparent_hugepage`. Without `/sys/kernel/mm` at all (a
+    /// chroot, a container without `/sys`) it cannot be told, and a unit taken to be the page while
+    /// the kernel backs the file in larger folios would charge a region for less than it holds - so
+    /// the transport is refused rather than run on a guess. (`/sys/kernel/mm` without
+    /// `transparent_hugepage` is a kernel without transparent huge pages, where the page is right.)
+    if (0 != ::access("/sys/kernel/mm", R_OK | X_OK))
+    {
+        const int saved_errno = errno;
+        ErrnoException::throwWithErrno(
+            ErrorCodes::NOT_IMPLEMENTED,
+            saved_errno,
+            "Shared-memory regions for executable UDFs need /sys/kernel/mm to tell the unit a memfd is backed in, "
+            "and this system does not provide it");
+    }
+
+    /// And what the kernel actually committed for that page is a lower bound for the unit, whatever
+    /// `/sys` says: never lowered by this, only raised.
+    struct stat probe_stat{};
+    if (0 != ::fstat(fd, &probe_stat))
+    {
+        const int saved_errno = errno;
+        ErrnoException::throwWithErrno(ErrorCodes::NOT_IMPLEMENTED, saved_errno, "Cannot fstat the shared-memory region probe");
+    }
+    observeBackingUnit(static_cast<size_t>(probe_stat.st_blocks) * 512);
 
     if (0 != ::fcntl(fd, F_ADD_SEALS, REGION_SEALS))
     {
@@ -211,9 +262,7 @@ void SharedMemoryRegion::checkSupported()
     /// punch would load the function and then keep pages nobody is charged for, so ask here, under
     /// the seals the region has, and check by the pages the file holds afterwards that the pages
     /// are really gone: a filter can answer success without doing anything.
-    const off_t page_size = static_cast<off_t>(::sysconf(_SC_PAGESIZE));
-    const off_t whole_file = std::numeric_limits<off_t>::max() / page_size * page_size;
-    if (0 != ::fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, whole_file))
+    if (0 != punchWholeFile(fd))
     {
         const int saved_errno = errno;
         ErrnoException::throwWithErrno(
@@ -432,9 +481,9 @@ namespace
 {
 
 /// Reads a small sysfs file into `out`; false if it cannot be read.
-bool readSysfsLine(const char * path, std::string & out)
+bool readSysfsLine(const std::string & path, std::string & out)
 {
-    int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd == -1)
         return false;
     SCOPE_EXIT({ closeNoThrow(fd, "sysfs probe"); });
@@ -451,34 +500,64 @@ bool readSysfsLine(const char * path, std::string & out)
     return true;
 }
 
-/// The unit a `memfd` is backed in: the page, unless the kernel backs `shmem` with transparent
-/// huge pages regardless of file size (`shmem_enabled` is `always` or `force`), in which case a
-/// file of any length holds at least one huge page and `st_blocks` says so - a 64 KiB region
-/// reports 2 MiB. Footprints and caps have to be compared in that unit, or a region would be over
-/// its own cap from the moment it is created (`within_size` and `advise` only use huge pages
-/// where they fit, and are the page as far as this is concerned). Read once.
+bool isAlwaysOrForce(const std::string & mode)
+{
+    return mode.contains("[always]") || mode.contains("[force]");
+}
+
+/// The unit a `memfd` is backed in: the page, unless `shmem` is backed with large folios regardless
+/// of the file's size, in which case a file of any length holds at least one such folio and
+/// `st_blocks` says so - a 64 KiB region reports 2 MiB. That is transparent huge pages with
+/// `shmem_enabled` `always` or `force`, and from Linux 6.11 on any size whose own
+/// `hugepages-<size>kB/shmem_enabled` is `always` (or `inherit`, with the former). Footprints and caps
+/// have to be compared in that unit, or a region would be over its own cap from the moment it is
+/// created (`within_size` and `advise` use large folios only where they fit, and are the page as far
+/// as this is concerned). The largest of them: a unit that is too large rounds a cap up by at most
+/// one such folio, while one that is too small discards every worker whose region the kernel backs
+/// with larger folios. Read once; `roundUpToPages` raises it further to what `checkSupported` saw the
+/// kernel commit for a page.
 size_t backingUnit()
 {
     const size_t page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    size_t unit = page_size;
 
-    std::string mode;
-    if (!readSysfsLine("/sys/kernel/mm/transparent_hugepage/shmem_enabled", mode))
-        return page_size;
-    if (!mode.contains("[always]") && !mode.contains("[force]"))
-        return page_size;
+    static const std::string thp_dir = "/sys/kernel/mm/transparent_hugepage";
 
-    std::string huge_page_size;
-    if (!readSysfsLine("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size", huge_page_size))
-        return page_size;
-    const size_t huge = std::strtoull(huge_page_size.c_str(), nullptr, 10);
-    return huge > page_size ? huge : page_size;
+    std::string top_mode;
+    const bool top_always = readSysfsLine(thp_dir + "/shmem_enabled", top_mode) && isAlwaysOrForce(top_mode);
+
+    /// Before the per-size knobs, the PMD size is the one large folio there is.
+    std::string pmd_size;
+    if (top_always && readSysfsLine(thp_dir + "/hpage_pmd_size", pmd_size))
+        unit = std::max(unit, static_cast<size_t>(std::strtoull(pmd_size.c_str(), nullptr, 10)));
+
+    std::error_code error;
+    for (auto it = std::filesystem::directory_iterator(thp_dir, error); !error && it != std::filesystem::directory_iterator();
+         it.increment(error))
+    {
+        const std::string name = it->path().filename().string();
+        if (!name.starts_with("hugepages-") || !name.ends_with("kB"))
+            continue;
+
+        std::string mode;
+        if (!readSysfsLine(it->path().string() + "/shmem_enabled", mode))
+            continue;
+        if (!mode.contains("[always]") && !(mode.contains("[inherit]") && top_always))
+            continue;
+
+        const size_t size_kb = std::strtoull(name.c_str() + std::strlen("hugepages-"), nullptr, 10);
+        unit = std::max(unit, size_kb * 1024);
+    }
+
+    return unit;
 }
 
 }
 
 size_t SharedMemoryRegion::roundUpToPages(size_t size)
 {
-    static const size_t unit = backingUnit();
+    static const size_t sysfs_unit = backingUnit();
+    const size_t unit = std::max(sysfs_unit, observed_backing_unit.load(std::memory_order_relaxed));
     return (size + unit - 1) / unit * unit;
 }
 

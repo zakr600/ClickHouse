@@ -16,12 +16,17 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 GO="$SHM_UDF_WORK/go"
 MARKER="$SHM_UDF_WORK/marker"
+PID_FILE="$SHM_UDF_WORK/pid"
 
 {
     echo "<function><type>executable_pool</type><name>pipe_late_stdout_lingers</name><return_type>UInt64</return_type>"
     echo "<argument><type>UInt64</type></argument><format>TabSeparated</format><pool_size>1</pool_size>"
     echo "<command_termination_timeout>86400</command_termination_timeout>"
     echo "<command>pipe_pool_late_stdout.py --go $GO --marker $MARKER --linger</command></function>"
+    echo "<function><type>executable_pool</type><name>pipe_short_answer_lingers</name><return_type>String</return_type>"
+    echo "<argument><type>UInt64</type></argument><format>TabSeparated</format><pool_size>1</pool_size>"
+    echo "<command_termination_timeout>1</command_termination_timeout>"
+    echo "<command>pipe_pool_short_answer_lingers.py --pid-file $PID_FILE</command></function>"
 } | shm_functions
 
 shm_local "
@@ -32,4 +37,12 @@ shm_local "
     INSERT INTO pids SELECT 2, pipe_late_stdout_lingers(1);
     SELECT uniqExact(pid) FROM pids;
     SELECT * FROM executable('shm_wait.sh reaped', TSV, 'ok UInt8', (SELECT pid FROM pids WHERE n = 1));
+"
+
+# The same for a worker that a query finds unfit when it is done with it: one that answered short
+# and then neither reads its stdin nor exits. The query fails for the short answer, and the worker,
+# once its grace period is over, is killed and reaped rather than signalled and left a zombie.
+shm_local "
+    SELECT pipe_short_answer_lingers(number) FROM numbers(3) FORMAT Null;
+    SELECT * FROM executable('shm_wait.sh reaped', TSV, 'ok UInt8', (SELECT toUInt64(c1) FROM file('$PID_FILE', TSV)));
 "

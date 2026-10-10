@@ -34,12 +34,22 @@ FAR=67108864
 LIMIT=33554432
 
 echo "--- the growth is refused under a limit the pages the command committed do not fit"
+# Only the code is checked, not what wraps it. The refused charge is taken off the query's tracker
+# right after it is refused, but for that moment the tracker holds it, and another thread of the same
+# query allocating then - the client polling the query's progress, say, which a debug build does
+# often - hits the limit first; the query fails with that thread's `MEMORY_LIMIT_EXCEEDED` instead of
+# the UDF's `UDF_EXECUTION_FAILED` around it. Either is the growth being refused - which the counters
+# say for certain: the command was called, and the region did not grow.
+GROWTH_EVENTS="SELECT sumIf(value, event = 'ExecutableUDFSharedMemoryCalls'),
+    sumIf(value, event = 'ExecutableUDFSharedMemoryRegionGrowths') FROM system.events;"
 shm_local "
     SELECT sum(length(shm_alloc(number))) FROM numbers(500)
     SETTINGS max_block_size = 500, max_memory_usage = $LIMIT, max_untracked_memory = 0;
-"
+    $GROWTH_EVENTS
+" | sed -E 's/^error:.* (MEMORY_LIMIT_EXCEEDED)( .*)?$/\1/'
 
 echo "--- and goes through without it"
 shm_local "
     SELECT sum(length(shm_alloc(number))) FROM numbers(500) SETTINGS max_block_size = 500;
+    $GROWTH_EVENTS
 "

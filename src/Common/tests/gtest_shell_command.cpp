@@ -403,7 +403,13 @@ TEST(ShellCommand, WaitDrainingOutputKeepsStderrWrittenJustBeforeExit)
     ASSERT_TRUE(waitUntilZombie(command->getPid()));
 
     std::string collected;
-    EXPECT_TRUE(command->waitDrainingOutput([&](std::string_view chunk) { collected += chunk; }));
+    EXPECT_TRUE(command->waitDrainingOutput({
+        .stderr_sink = [&](std::string_view chunk) { collected += chunk; },
+        .check_exit_status = true,
+        .unbounded_status_wait = false,
+        .limit_stdout_drain = false,
+        .check_cancelled = {},
+    }));
     EXPECT_EQ(collected, "boom-boom-boom");
 }
 
@@ -418,8 +424,13 @@ TEST(ShellCommand, WaitDrainingOutputKeepsStderrWithoutCheckingTheExitStatus)
     ASSERT_TRUE(waitUntilZombie(command->getPid()));
 
     std::string collected;
-    EXPECT_TRUE(command->waitDrainingOutput(
-        [&](std::string_view chunk) { collected += chunk; }, /*check_exit_status=*/ false));
+    EXPECT_TRUE(command->waitDrainingOutput({
+        .stderr_sink = [&](std::string_view chunk) { collected += chunk; },
+        .check_exit_status = false,
+        .unbounded_status_wait = false,
+        .limit_stdout_drain = false,
+        .check_cancelled = {},
+    }));
     EXPECT_EQ(collected, "boom");
 }
 
@@ -434,7 +445,15 @@ TEST(ShellCommand, WaitDrainingOutputKeepsStderrOfASignalledChild)
     ASSERT_TRUE(waitUntilZombie(command->getPid()));
 
     std::string collected;
-    EXPECT_THROW(command->waitDrainingOutput([&](std::string_view chunk) { collected += chunk; }), DB::Exception);
+    EXPECT_THROW(
+        command->waitDrainingOutput({
+            .stderr_sink = [&](std::string_view chunk) { collected += chunk; },
+            .check_exit_status = true,
+            .unbounded_status_wait = false,
+            .limit_stdout_drain = false,
+            .check_cancelled = {},
+        }),
+        DB::Exception);
     EXPECT_EQ(collected, "boom");
 }
 
@@ -453,13 +472,17 @@ TEST(ShellCommand, WaitDrainingOutputCanCancelAfterOutputCloses)
     size_t checks = 0;
     try
     {
-        command->waitDrainingOutput(
-            {}, /*check_exit_status=*/ true, /*unbounded_status_wait=*/ true, /*limit_stdout_drain=*/ false,
-            [&]
+        command->waitDrainingOutput({
+            .stderr_sink = {},
+            .check_exit_status = true,
+            .unbounded_status_wait = true,
+            .limit_stdout_drain = false,
+            .check_cancelled = [&]
             {
                 if (++checks == 3)
                     throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "Cancelled shell command wait");
-            });
+            },
+        });
         FAIL() << "Expected cancellation";
     }
     catch (const Exception & exception)

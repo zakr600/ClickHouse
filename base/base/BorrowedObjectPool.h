@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
 #include <vector>
 #include <type_traits>
 #include <chrono>
@@ -115,32 +116,49 @@ public:
             std::is_nothrow_move_constructible_v<T> || std::is_copy_constructible_v<T>,
             "BorrowedObjectPool needs a T that is nothrow move constructible or copy constructible: "
             "otherwise a return that throws could leave the pool's other objects moved-from");
+        static_assert(
+            std::is_nothrow_move_constructible_v<T>
+                || (std::is_nothrow_default_constructible_v<T> && std::is_nothrow_move_assignable_v<T>),
+            "BorrowedObjectPool needs a T whose value can be destroyed without throwing - by a move, or by "
+            "assigning a default one - for a return that fails: see `discardNoThrow`");
 
+        std::exception_ptr return_failure;
         {
             std::lock_guard lock(objects_mutex);
 
             try
             {
                 objects.emplace_back(std::move(object_to_return));
+                --borrowed_objects_size;
             }
             catch (...)
             {
-                /// The object does not make it back into the pool, so the pool must not keep
-                /// counting it: otherwise every such failure permanently costs one slot of
-                /// `max_size`, and after enough of them borrowing only ever times out. Nothing
-                /// else changed (see the `static_assert` above).
+                return_failure = std::current_exception();
+            }
+        }
+
+        if (return_failure)
+        {
+            /// The object does not make it back into the pool, so the pool must not keep counting
+            /// it: otherwise every such failure permanently costs one slot of `max_size`, and after
+            /// enough of them borrowing only ever times out. Nothing else changed (see the
+            /// `static_assert` above) - in particular the object is still whole, in the caller's
+            /// hands. It is destroyed first, and only then is its slot given back: a waiter woken
+            /// for the slot allocates a replacement at once, and the two alive together would be one
+            /// more than `max_size` - for a pool of processes, one more process. Destroyed outside
+            /// the lock, because destroying a pooled process can take a while.
+            discardNoThrow(object_to_return);
+
+            {
+                std::lock_guard lock(objects_mutex);
                 --allocated_objects_size;
                 --borrowed_objects_size;
-
-                /// Nothing was pushed into `objects`, so the freed slot is the only thing a waiter
-                /// can go on, and it is what waiters watch for besides a returned object. Wake one
-                /// here - the notify after this block is skipped by the unwinding - or a pool with
-                /// `max_size == 1` leaves its only waiter asleep with the pool standing empty.
-                condition_variable.notify_one();
-                throw;
             }
 
-            --borrowed_objects_size;
+            /// Nothing was pushed into `objects`, so the freed slot is the only thing a waiter can go
+            /// on, and it is what waiters watch for besides a returned object.
+            condition_variable.notify_one();
+            std::rethrow_exception(return_failure);
         }
 
         condition_variable.notify_one();
@@ -166,6 +184,33 @@ public:
         return allocated_objects_size == max_size;
     }
 
+    /// Borrowed objects size. If borrowedObjectsSize == allocatedObjectsSize and pool is full.
+    /// Then client will wait during borrowObject function call.
+    size_t borrowedObjectsSize() const
+    {
+        std::lock_guard lock(objects_mutex);
+        return borrowed_objects_size;
+    }
+
+private:
+    /// The test reaches `waitingBorrowersSize` through this, rather than the pool's public interface.
+    friend struct BorrowedObjectPoolTestAccess;
+
+    /// Destroys what `object` holds, now, without throwing. Not by moving it out when the move can
+    /// throw - a failing move is exactly how a return can fail - but by assigning a default value,
+    /// which leaves the caller a harmless empty object to destroy in its own time.
+    static void discardNoThrow(T & object) noexcept
+    {
+        if constexpr (std::is_nothrow_move_constructible_v<T>)
+        {
+            [[maybe_unused]] T discarded(std::move(object));
+        }
+        else
+        {
+            object = T{};
+        }
+    }
+
     /// Number of threads currently blocked inside `borrowObject`/`tryBorrowObject` waiting for an
     /// object to be returned or for a slot to free up. The counter is incremented under
     /// `objects_mutex` before the wait, which only releases the mutex once the thread is registered
@@ -177,16 +222,6 @@ public:
         std::lock_guard lock(objects_mutex);
         return waiting_borrowers_size;
     }
-
-    /// Borrowed objects size. If borrowedObjectsSize == allocatedObjectsSize and pool is full.
-    /// Then client will wait during borrowObject function call.
-    size_t borrowedObjectsSize() const
-    {
-        std::lock_guard lock(objects_mutex);
-        return borrowed_objects_size;
-    }
-
-private:
 
     /// Both must be called under `objects_mutex`.
 

@@ -120,15 +120,14 @@ public:
         return wait_called;
     }
 
-    /// Ends the grace period `command_termination_timeout` gives the command to exit on its own:
-    /// the destructor then signals it at once instead of waiting. For a command that is thrown away
-    /// with nobody interested in how it exits - a pooled worker found unfit before it is lent out -
-    /// so that whoever drops it does not sit out the timeout on a command that ignores stdin EOF.
-    void endTerminationGracePeriod() noexcept;
+    /// For a command that is thrown away: once the grace period is over, the destructor kills it
+    /// with `SIGKILL` and reaps it, rather than sending `termination_signal` and leaving it to exit -
+    /// and stay a zombie, with its pid in `UDFProcessRegistry` - on its own. A command written to
+    /// exit on stdin EOF still gets the grace period to do so.
+    void reapOnDestruction() noexcept { reap_on_destruction = true; }
 
-    /// For a command that is thrown away with nobody interested in how it exits: no grace period
-    /// (`endTerminationGracePeriod`), and the destructor kills it with `SIGKILL` and reaps it,
-    /// rather than sending `termination_signal` and leaving it to exit - and stay a zombie - on its own.
+    /// The same, without the grace period (`endTerminationGracePeriod`): for a command nobody is
+    /// interested in how it exits.
     void discardWithoutGrace() noexcept;
 
     /// Closes every descriptor the command reads its input from: its `stdin` and the extra
@@ -247,12 +246,16 @@ public:
     /// exits is waited for, with `unbounded_status_wait`, until `check_cancelled` throws.
     /// `check_cancelled` may throw to interrupt the wait; cancellation also ends the termination
     /// grace period so the destructor can stop the command promptly.
-    bool waitDrainingOutput(
-        const StderrSink & stderr_sink = {},
-        bool check_exit_status = true,
-        bool unbounded_status_wait = false,
-        bool limit_stdout_drain = false,
-        const std::function<void()> & check_cancelled = {});
+    struct WaitDrainingOptions
+    {
+        StderrSink stderr_sink;
+        bool check_exit_status = true;
+        bool unbounded_status_wait = false;
+        bool limit_stdout_drain = false;
+        std::function<void()> check_cancelled;
+    };
+
+    bool waitDrainingOutput(const WaitDrainingOptions & options);
 
     WriteBufferFromFile in;        /// If the command reads from stdin, do not forget to call in.close() after writing all the data there.
     ReadBufferFromFile out;
@@ -274,19 +277,14 @@ private:
     /// somebody else, so it is neither signalled nor waited for.
     bool child_reaped = false;
 
-    /// Set by `discardWithoutGrace`.
-    bool discard_without_grace = false;
+    /// Set by `reapOnDestruction` and `discardWithoutGrace`.
+    bool reap_on_destruction = false;
 
     /// Records that the child has been reaped or is not a child of this process any more
     /// (`child_reaped`): from then on it is neither waited for nor signalled - `wait_called` is set
     /// too, which is what the destructor looks at - and it leaves `UDFProcessRegistry`, whose
     /// sampling would otherwise follow its pid to whatever process gets the number next.
     void forgetChild();
-
-    /// Sends `SIGKILL` to the child's process group and reaps the child (`Config::own_process_group`).
-    /// Only while the child is still an unreaped child of this process: otherwise the number may
-    /// already name somebody else.
-    void killProcessGroupAndReapNoThrow() noexcept;
 
     /// Sends `SIGKILL` to the process group of a child that has exited and is not reaped yet
     /// (`Config::own_process_group`), so that what it left behind in its group dies with it.
@@ -316,12 +314,20 @@ private:
     /// deadline has passed, so both wait paths stop at one shared budget.
     UInt64 remainingTerminationTimeoutMs();
 
+    /// Ends the grace period `command_termination_timeout` gives the command to exit on its own:
+    /// the destructor then signals it at once instead of waiting. Private: a caller that ends it
+    /// for a command it discards wants `discardWithoutGrace`, which also has the command killed
+    /// and reaped rather than signalled and left a zombie.
+    void endTerminationGracePeriod() noexcept;
+
     ShellCommand(pid_t pid_, int & in_fd_, int & out_fd_, int & err_fd_, const Config & config);
 
     bool tryWaitProcessWithTimeout(size_t timeout_in_milliseconds);
 
-    /// Sends `SIGKILL` to the child and reaps it (`discardWithoutGrace`).
-    void killAndReapNoThrow() noexcept;
+    /// Sends `SIGKILL` to the child - and to its whole process group, with `whole_group` - and reaps
+    /// it. Only while it is still an unreaped child of this process: otherwise its pid may belong to
+    /// somebody else, and it is only forgotten (`forgetChild`).
+    void killAndReapNoThrow(bool whole_group) noexcept;
     struct tryWaitResult;
 
     /// `close_streams = false` leaves the child's pipes open after it has been reaped. Only

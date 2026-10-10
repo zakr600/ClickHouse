@@ -109,6 +109,7 @@ namespace ErrorCodes
     extern const int CANNOT_CREATE_CHILD_PROCESS;
     extern const int BAD_ARGUMENTS;
     extern const int CANNOT_FCNTL;
+    extern const int CANNOT_READ_FROM_FILE_DESCRIPTOR;
 }
 
 ShellCommand::ShellCommand(pid_t pid_, int & in_fd_, int & out_fd_, int & err_fd_, const ShellCommand::Config & config_)
@@ -150,29 +151,7 @@ void ShellCommand::endTerminationGracePeriod() noexcept
 void ShellCommand::discardWithoutGrace() noexcept
 {
     endTerminationGracePeriod();
-    discard_without_grace = true;
-}
-
-void ShellCommand::killAndReapNoThrow() noexcept
-{
-    try
-    {
-        /// Unreaped, so the pid is still this child's own.
-        if (0 != ::kill(pid, SIGKILL) && errno != ESRCH)
-            LOG_WARNING(getLogger(), "Cannot kill shell command pid {}, error: '{}'", pid, errnoToString());
-
-        /// Nothing to wait out after `SIGKILL`: the bound only covers the time the kernel takes to
-        /// tear the child down.
-        static constexpr size_t reap_after_kill_timeout_ms = 5000;
-        if (waitForPidMilliseconds(pid, reap_after_kill_timeout_ms) == WaitForPidResult::EXITED)
-            forgetChild();
-        else
-            LOG_WARNING(getLogger(), "Shell command pid {} was not reaped within {} ms after SIGKILL", pid, reap_after_kill_timeout_ms);
-    }
-    catch (...)
-    {
-        tryLogCurrentException(getLogger());
-    }
+    reapOnDestruction();
 }
 
 ShellCommand::~ShellCommand()
@@ -185,7 +164,7 @@ ShellCommand::~ShellCommand()
     /// child that exited was reaped only after its group got `SIGKILL` (`killGroupOfExitedChild`).
     SCOPE_EXIT({
         if (config.own_process_group)
-            killProcessGroupAndReapNoThrow();
+            killAndReapNoThrow(/*whole_group=*/ true);
     });
 
     if (wait_called)
@@ -205,12 +184,12 @@ ShellCommand::~ShellCommand()
         if (config.own_process_group)
             return;
 
-        /// Nobody is interested in how a discarded command exits, so it is not asked to: it is
-        /// killed, and reaped, so that it leaves no zombie behind - and no entry in the registry
-        /// of UDF processes. `termination_signal` is for a command whose exit might still matter.
-        if (discard_without_grace)
+        /// A discarded command that has not exited within its grace period is killed, and reaped,
+        /// so that it leaves no zombie behind - and no entry in the registry of UDF processes.
+        /// `termination_signal` is for a command whose exit might still matter.
+        if (reap_on_destruction)
         {
-            killAndReapNoThrow();
+            killAndReapNoThrow(/*whole_group=*/ false);
             return;
         }
 
@@ -239,15 +218,9 @@ bool ShellCommand::tryWaitProcessWithTimeout(size_t timeout_in_milliseconds)
 
     wait_called = true;
 
-    in.close();
-    out.close();
-    err.close();
-
-    for (auto & [_, fd] : write_fds)
-        fd.close();
-
-    for (auto & [_, fd] : read_fds)
-        fd.close();
+    /// Before the wait: a child blocked writing into a pipe nobody drains any more gets `EPIPE`
+    /// rather than the whole timeout.
+    closeStreams();
 
     if (config.own_process_group)
     {
@@ -255,7 +228,7 @@ bool ShellCommand::tryWaitProcessWithTimeout(size_t timeout_in_milliseconds)
         /// number of the group from being reused in between.
         if (waitForPidMilliseconds(pid, timeout_in_milliseconds, /*leave_unreaped=*/ true) != WaitForPidResult::EXITED)
             return false;
-        killProcessGroupAndReapNoThrow();
+        killAndReapNoThrow(/*whole_group=*/ true);
         return child_reaped;
     }
 
@@ -281,7 +254,7 @@ void ShellCommand::killGroupOfExitedChild()
         LOG_WARNING(getLogger(), "Cannot kill the process group of shell command pid {}, error: '{}'", pid, errnoToString());
 }
 
-void ShellCommand::killProcessGroupAndReapNoThrow() noexcept
+void ShellCommand::killAndReapNoThrow(bool whole_group) noexcept
 {
     if (child_reaped)
         return;
@@ -290,31 +263,47 @@ void ShellCommand::killProcessGroupAndReapNoThrow() noexcept
     {
         /// `child_reaped` can be false for a pid that is not ours any more: a `waitpid` that failed
         /// says nothing about the child, and somebody else may have reaped it. Only a child that
-        /// `waitid` still finds, alive or a zombie, keeps its pid - which is the number of the
-        /// group it leads - to itself, so that a signal to `-pid` reaches this group and nothing else.
+        /// `waitid` still finds, alive or a zombie, keeps its pid - and the number of the group it
+        /// leads - to itself, so that a signal reaches this child and nothing else.
         if (peekChildState(pid, /*blocking=*/ false) == ChildState::NOT_OUR_CHILD)
         {
             forgetChild();
-            LOG_WARNING(getLogger(), "Shell command pid {} is no longer a child of this process; its process group is not signalled", pid);
+            LOG_WARNING(getLogger(), "Shell command pid {} is no longer a child of this process; it is not signalled", pid);
             return;
         }
 
-        if (0 != ::kill(-pid, SIGKILL) && errno != ESRCH)
+        if (whole_group && 0 != ::kill(-pid, SIGKILL) && errno != ESRCH)
             LOG_WARNING(getLogger(), "Cannot kill the process group of shell command pid {}, error: '{}'", pid, errnoToString());
 
-        /// And the child itself, which the group does not reach if the child has moved to another
-        /// group (`setpgid`). Its pid is its own for as long as it is not reaped.
+        /// And the child itself - which the group does not reach if the child has moved to another
+        /// group (`setpgid`).
         if (0 != ::kill(pid, SIGKILL) && errno != ESRCH)
             LOG_WARNING(getLogger(), "Cannot kill shell command pid {}, error: '{}'", pid, errnoToString());
 
         /// Nothing to wait out after `SIGKILL`: the child cannot run user code again, and the bound
         /// only covers the time the kernel takes to tear it down.
-        static constexpr size_t reap_after_kill_timeout_seconds = 5;
+        static constexpr size_t reap_after_kill_timeout_ms = 5000;
         wait_called = true;
-        if (waitForPid(pid, reap_after_kill_timeout_seconds))
-            forgetChild();
-        else
-            LOG_WARNING(getLogger(), "Shell command pid {} was not reaped within {} seconds after SIGKILL", pid, reap_after_kill_timeout_seconds);
+        switch (waitForPidMilliseconds(pid, reap_after_kill_timeout_ms))
+        {
+            case WaitForPidResult::EXITED:
+                forgetChild();
+                break;
+            case WaitForPidResult::ERROR:
+            {
+                /// The wait failed, which by itself says nothing about the child: it may have been
+                /// reaped by somebody else in between, or the wait may have run out of descriptors
+                /// (`pidfd_open`) with the child still ours. Only the first is forgotten.
+                const int saved_errno = errno;
+                if (peekChildState(pid, /*blocking=*/ false) == ChildState::NOT_OUR_CHILD)
+                    forgetChild();
+                LOG_WARNING(getLogger(), "Cannot reap shell command pid {} after SIGKILL: {}", pid, errnoToString(saved_errno));
+                break;
+            }
+            case WaitForPidResult::TIMEOUT:
+                LOG_WARNING(getLogger(), "Shell command pid {} was not reaped within {} ms after SIGKILL", pid, reap_after_kill_timeout_ms);
+                break;
+        }
     }
     catch (...)
     {
@@ -588,12 +577,26 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
         /// about to fail for one that started. Wait for its report or for the end of the pipe: the
         /// write end is close-on-exec, so it goes at `exec` or at exit - in this child, and in any
         /// other one spawned meanwhile that inherited it.
+        ///
+        /// Bounded all the same: a child spawned meanwhile by another thread that inherited the write
+        /// end and stalls before its own `exec` must not hang this one. Past the bound the report
+        /// is read as in any other build, without waiting.
         {
+            static constexpr UInt64 child_report_wait_ms = 10000;
+            const UInt64 deadline_ns = clock_gettime_ns() + child_report_wait_ms * 1000000ULL;
             pollfd pfd{};
             pfd.fd = pipe_child_error.fds_rw[0];
             pfd.events = POLLIN;
-            while (::poll(&pfd, 1, -1) < 0 && errno == EINTR)
+            while (true)
             {
+                const UInt64 now_ns = clock_gettime_ns();
+                const int res = now_ns >= deadline_ns ? 0 : ::poll(&pfd, 1, static_cast<int>((deadline_ns - now_ns) / 1000000ULL + 1));
+                if (res < 0 && errno == EINTR)
+                    continue;
+                if (res == 0)
+                    LOG_WARNING(
+                        getLogger(), "The child error pipe of pid {} neither reported nor closed within {} ms", pid, child_report_wait_ms);
+                break;
             }
         }
 #endif
@@ -962,8 +965,13 @@ void ShellCommand::readBufferedOutput(int (&drain_fds)[2], const StderrSink & st
         int available = 0;
         if (0 != ::ioctl(drain_fds[i], FIONREAD, &available))
         {
-            LOG_WARNING(getLogger(), "Cannot query the pipe of shell command pid {} for buffered bytes, error: '{}'", pid, errnoToString());
-            continue;
+            /// Not skipped, and not read some other way: what the command said on its way out is
+            /// what this read is for, and a pipe whose content cannot even be counted is a broken
+            /// descriptor - which has to be seen, not worked around.
+            const int saved_errno = errno;
+            ErrnoException::throwWithErrno(
+                ErrorCodes::CANNOT_READ_FROM_FILE_DESCRIPTOR, saved_errno,
+                "Cannot query the pipe of shell command pid {} for buffered bytes", pid);
         }
 
         while (available > 0)
@@ -1104,13 +1112,14 @@ void ShellCommand::drainOutputPipes(
 }
 
 
-bool ShellCommand::waitDrainingOutput(
-    const StderrSink & stderr_sink,
-    bool check_exit_status,
-    bool unbounded_status_wait,
-    bool limit_stdout_drain,
-    const std::function<void()> & check_cancelled)
+bool ShellCommand::waitDrainingOutput(const WaitDrainingOptions & options)
 {
+    const auto & stderr_sink = options.stderr_sink;
+    const bool check_exit_status = options.check_exit_status;
+    const bool unbounded_status_wait = options.unbounded_status_wait;
+    const bool limit_stdout_drain = options.limit_stdout_drain;
+    const auto & check_cancelled = options.check_cancelled;
+
     LOG_TRACE(getLogger(), "Will wait for shell command pid {} while draining its output", pid);
     /// A child that writes past what the protocol asked of it fills the pipe and blocks in `write`.
     /// Nothing reads that pipe any more by the time this is called, so the only way the child ever
@@ -1145,7 +1154,8 @@ bool ShellCommand::waitDrainingOutput(
     static constexpr size_t stray_stdout_limit = 64 * 1024;
     size_t stdout_bytes_drained = 0;
     bool stdout_closed_here = false;
-    bool exit_grace_used = false;
+    /// Set once the child's output has ended and the budget has run out - see below.
+    UInt64 exit_grace_deadline_ns = 0;
 
     /// The child's `pidfd`, if the kernel gives one: polled together with the pipes, it lets the
     /// wait sleep until there is output or an exit to deal with, coming back only every
@@ -1153,7 +1163,7 @@ bool ShellCommand::waitDrainingOutput(
     /// every `poll_step_ms` to look for the exit itself.
     int exit_fd = -1;
 #if defined(OS_LINUX)
-    exit_fd = syscall_pidfd_open(pid);
+    exit_fd = openPidFdForWaiting(pid);
 #endif
     SCOPE_EXIT({
         if (exit_fd >= 0 && 0 != ::close(exit_fd))
@@ -1161,6 +1171,24 @@ bool ShellCommand::waitDrainingOutput(
     });
     static constexpr UInt64 exit_fd_step_ms = 100;
     const UInt64 wait_step_ms = exit_fd >= 0 ? exit_fd_step_ms : poll_step_ms;
+
+    /// Waits up to `timeout_ms` for the child to exit, leaving it unreaped for the loop to collect -
+    /// on the `pidfd` already open when there is one.
+    auto wait_for_exit = [&](UInt64 timeout_ms)
+    {
+        if (exit_fd >= 0)
+        {
+            pollfd pfd{};
+            pfd.fd = exit_fd;
+            pfd.events = POLLIN;
+            if (::poll(&pfd, 1, static_cast<int>(timeout_ms)) < 0 && errno != EINTR)
+                throw ErrnoException(ErrorCodes::CANNOT_WAITPID, "Cannot wait for shell command pid {}", pid);
+            return;
+        }
+
+        if (waitForPidMilliseconds(pid, timeout_ms, /*leave_unreaped=*/ true) == WaitForPidResult::ERROR)
+            throw Exception(ErrorCodes::CANNOT_WAITPID, "Cannot wait for shell command pid {}", pid);
+    };
 
     while (true)
     {
@@ -1258,18 +1286,25 @@ bool ShellCommand::waitDrainingOutput(
             /// are dropped".
             readBufferedOutput(drain_fds, stderr_sink);
 
-            /// A child whose output has ended - both pipes at EOF, by its own doing - has made its
-            /// last write and is on its way out: `exit` closes its descriptors before the kernel
-            /// makes it a zombie, so a probe in between finds it alive. It is not one that lingers,
-            /// and failing a query for that instant would turn a budget that has run out (or a
-            /// `command_termination_timeout` of zero) into a race. So it gets that instant, once.
-            if (!exit_grace_used && !stdout_closed_here && outputPipesHaveEnded(drain_fds))
+            /// A child whose output has ended - both pipes at EOF, by its own doing - has made its last
+            /// write and is, as a rule, on its way out: `exit` closes its descriptors before the
+            /// kernel makes it a zombie, so a probe in between finds it alive, and failing a query
+            /// for that instant would turn a budget that has run out (or a
+            /// `command_termination_timeout` of zero) into a race. Such a child gets a short grace
+            /// on top, in steps that come back here - for cancellation, and for the reap above. One
+            /// that closed its output and goes on living is not given more than that.
+            if (!stdout_closed_here && outputPipesHaveEnded(drain_fds))
             {
-                exit_grace_used = true;
-                static constexpr size_t exit_grace_ms = 100;
-                if (waitForPidMilliseconds(pid, exit_grace_ms, /*leave_unreaped=*/ true) == WaitForPidResult::ERROR)
-                    throw Exception(ErrorCodes::CANNOT_WAITPID, "Cannot wait for shell command pid {}", pid);
-                continue;
+                static constexpr UInt64 exit_grace_ms = 1000;
+                static constexpr UInt64 exit_grace_step_ms = 100;
+                const UInt64 now_ns = clock_gettime_ns();
+                if (exit_grace_deadline_ns == 0)
+                    exit_grace_deadline_ns = now_ns + exit_grace_ms * 1000000ULL;
+                if (now_ns < exit_grace_deadline_ns)
+                {
+                    wait_for_exit(std::min<UInt64>(exit_grace_step_ms, (exit_grace_deadline_ns - now_ns) / 1000000ULL + 1));
+                    continue;
+                }
             }
             return false;
         }
@@ -1286,10 +1321,7 @@ bool ShellCommand::waitDrainingOutput(
             /// least every `exit_wait_step_ms` to check for cancellation and the budget: there is
             /// nothing on the pipes to come back for sooner.
             static constexpr UInt64 exit_wait_step_ms = 100;
-            const auto result = waitForPidMilliseconds(
-                pid, unbounded ? exit_wait_step_ms : std::min(remaining_ms, exit_wait_step_ms), /*leave_unreaped=*/ true);
-            if (result == WaitForPidResult::ERROR)
-                throw Exception(ErrorCodes::CANNOT_WAITPID, "Cannot wait for shell command pid {}", pid);
+            wait_for_exit(unbounded ? exit_wait_step_ms : std::min(remaining_ms, exit_wait_step_ms));
             continue;
         }
 
@@ -1298,6 +1330,7 @@ bool ShellCommand::waitDrainingOutput(
             /*check_cancelled=*/ {}, exit_fd);
     }
 }
+
 
 bool ShellCommand::outputPipesHaveEnded(const int (&drain_fds)[2]) const
 {
