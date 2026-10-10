@@ -453,6 +453,16 @@ public:
     /// Whether a pipe holds bytes nobody has read: what a pooled process wrote after its last answer.
     static bool pipeHasPendingOutput(int fd) noexcept { return (pipePendingEvents(fd) & POLLIN) != 0; }
 
+    /// Whether the command's stderr holds bytes nobody has read, whatever the reaction.
+    bool stderrHasPendingOutput() const noexcept { return pipeHasPendingOutput(stderr_fd); }
+
+    /// Whether the write end of the pipe `fd` reads from is closed, with nothing left to read.
+    static bool pipeHasHungUp(int fd) noexcept
+    {
+        const Int16 events = pipePendingEvents(fd);
+        return (events & POLLHUP) != 0 && (events & POLLIN) == 0;
+    }
+
     /// `consider_buffered_output` says whether bytes this buffer has read but not handed on count
     /// as unread output. They do for the shared-memory transport, where every byte of the response
     /// frame is accounted for and a leftover is a protocol violation. They do not for the pipe
@@ -472,10 +482,13 @@ public:
         /// would discard a healthy worker on every borrow and turn the pool into a process per call.
         /// A child that has actually exited hangs up stdout too, which is where that is caught.
         ///
-        /// Nothing is asked at all under `ExternalCommandStderrReaction::NONE`: those bytes are read
-        /// and dropped on the floor, so there is no query for them to be misattributed to and no
-        /// reason to spend a worker over them.
-        if (stderr_reaction != ExternalCommandStderrReaction::NONE)
+        /// Asked only under `ExternalCommandStderrReaction::THROW`, the one reaction under which
+        /// stderr that reaches the wrong query is a wrong verdict rather than a log line in the
+        /// wrong place. Under every other one the next borrow takes what is left off the pipe
+        /// without the reaction and logs it against the worker (`quarantineReusedWorker`,
+        /// `discardStderrLeftByAPreviousBorrow`), and a command that keeps logging is not worth
+        /// a process per call.
+        if (stderr_reaction == ExternalCommandStderrReaction::THROW)
             state.stderr_has_unread_output = (pipePendingEvents(stderr_fd) & (POLLIN | POLLERR | POLLNVAL)) != 0;
 
         return state;
@@ -880,22 +893,7 @@ static std::function<void()> queryKilledCheck(const ContextPtr & context)
 
 static bool pooledProcessHasExitedCleanly(const ShellCommand & process)
 {
-    pollfd pfd{};
-    pfd.fd = process.out.getFD();
-    pfd.events = POLLIN;
-
-    int res = 0;
-    do
-    {
-        pfd.revents = 0;
-        res = ::poll(&pfd, 1, 0);
-    }
-    while (res < 0 && errno == EINTR);
-
-    if (res <= 0)
-        return false;
-
-    return (pfd.revents & POLLHUP) != 0 && (pfd.revents & POLLIN) == 0;
+    return TimeoutReadBufferFromFileDescriptor::pipeHasHungUp(process.out.getFD());
 }
 
 class ShellCommandHolder
@@ -1004,11 +1002,6 @@ public:
     const std::optional<BorrowerIdentity> & lastBorrower() const { return last_borrower; }
     void recordBorrower(BorrowerIdentity borrower) { last_borrower = std::move(borrower); }
 
-    /// The id for the next request to this process. It lives on the holder rather than on the
-    /// borrower because what it is for is telling this request's response apart from anything the
-    /// process wrote for an earlier one - and an earlier one can belong to an earlier borrow.
-    UInt64 nextRequestId() const { return generateRequestId(); }
-
     /// The shared-memory region for this process, created once and reused across pool borrows.
     ///
     /// Creating and growing the region does not charge any memory tracker here: while the holder is
@@ -1068,12 +1061,15 @@ public:
     ///
     /// A borrow can discard the worker before it has taken the region's charge over
     /// (`releaseChargeToBorrower`), while the holder still charges it globally. The charge is
-    /// dropped only after both are gone: destroying the process can take up to
-    /// `command_termination_timeout`, and the region stays resident for all of that time, so it
-    /// has to stay counted. Once the borrower has taken the charge over there is nothing left here
+    /// dropped only after both are gone: the region stays resident until the process has been
+    /// signalled and reaped, so it has to stay counted until then. Once the borrower has taken the charge over there is nothing left here
     /// to drop, and the borrower's own charge covers the region until it is gone.
     void discardWorkerAndRegion() noexcept
     {
+        /// Nobody waits for how a worker that is thrown away exits: it is signalled at once rather
+        /// than given `command_termination_timeout`, which whoever drops it would sit out.
+        if (returned_command)
+            returned_command->discardWithoutGrace();
         returned_command.reset();
         shared_memory.reset();
 
@@ -1197,7 +1193,8 @@ namespace
             const ShellCommandSourceConfiguration & configuration_ = {},
             std::unique_ptr<ShellCommandHolder> && command_holder_ = nullptr,
             std::shared_ptr<ProcessPool> process_pool_ = nullptr,
-            bool worker_is_reused_ = false)
+            bool worker_is_reused_ = false,
+            bool is_user_defined_function_ = false)
             : ISource(std::make_shared<const Block>(sample_block_->cloneEmpty()))
             , context(context_)
             , format(format_)
@@ -1209,6 +1206,7 @@ namespace
             , process_pool(process_pool_)
             , check_exit_code(check_exit_code_)
             , worker_is_reused(worker_is_reused_)
+            , is_user_defined_function(is_user_defined_function_)
             , command(std::move(command_))
             , command_holder(std::move(command_holder_))
         {
@@ -1457,7 +1455,7 @@ namespace
                 /// leaves the source, so that the exception marks the command invalid and a
                 /// pooled worker is discarded instead of being returned as if it had answered
                 /// correctly - which is what counting the rows further up the pipeline would do.
-                if (configuration.read_fixed_number_of_rows
+                if (is_user_defined_function && configuration.read_fixed_number_of_rows
                     && current_read_rows + chunk.getNumRows() > configuration.number_of_rows_to_read)
                     throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
                         "Executable UDF wrong result, expected {} row(s), but the command produced more (at least {})",
@@ -1888,8 +1886,11 @@ namespace
 
             try
             {
-                const String leftover_stderr
-                    = state.stderr_has_unread_output ? timeout_command_out.consumePendingStderr() : String{};
+                /// Read for the report under every reaction that observes stderr, not only when it is
+                /// what disqualified the worker (`channelState` asks about it under `throw` alone).
+                const bool read_stderr = state.stderr_has_unread_output
+                    || (timeout_command_out.stderrIsObserved() && timeout_command_out.stderrHasPendingOutput());
+                const String leftover_stderr = read_stderr ? timeout_command_out.consumePendingStderr() : String{};
 
                 if (state.stdout_hung_up && !state.stdout_has_unread_output)
                 {
@@ -1999,6 +2000,12 @@ namespace
         /// Whether `command` is a process that has already served a borrow, and may therefore have
         /// left something on its pipes. A freshly started one cannot have.
         bool worker_is_reused = false;
+
+        /// Whether this source serves an executable UDF, whose protocol is one row per input row:
+        /// only there is a command that answers with more rows than it was sent wrong. The
+        /// `executable_pool` dictionary source and the `ExecutablePool` table engine have always
+        /// taken a block with more rows than they asked for as it is.
+        bool is_user_defined_function = false;
 
         /// Taken over after every other member, because every other member has to be able to throw
         /// without costing a healthy pooled worker: until this object owns these two they still
@@ -2652,7 +2659,7 @@ namespace
             return write_buffer.count();
         }
 
-        /// Request to the child: protocol version, file path, input offset, input size.
+        /// Request to the child: protocol version, request id, file path, input offset, input size.
         void sendRequest(size_t input_size, UInt64 request_id)
         {
             writeVarUInt(SHARED_MEMORY_PROTOCOL_VERSION, *timeout_command_in);
@@ -2661,16 +2668,6 @@ namespace
             writeVarUInt(static_cast<UInt64>(0), *timeout_command_in);
             writeVarUInt(static_cast<UInt64>(input_size), *timeout_command_in);
             timeout_command_in->next();
-        }
-
-        /// The id for the next request to this process. Routed through the holder when there is
-        /// one only so that the two paths read the same; the value is drawn at random either way.
-        UInt64 nextRequestId() const
-        {
-            if (command_holder)
-                return command_holder->nextRequestId();
-
-            return generateRequestId();
         }
 
         /// Sends the request to the child and sets up output_executor over the response. The region
@@ -2695,7 +2692,7 @@ namespace
 
             while (true)
             {
-                const UInt64 request_id = nextRequestId();
+                const UInt64 request_id = generateRequestId();
                 sendRequest(input_size, request_id);
                 timeout_command_out->armFrameDeadline();
 
@@ -2731,7 +2728,7 @@ namespace
                 {
                     /// The result does not fit next to the input; the server is the only side that
                     /// can enlarge the region, so it does that and re-sends the same request. The
-                    /// serialized input survives the growth (`ftruncate` keeps the file contents),
+                    /// serialized input survives the growth (`posix_fallocate` keeps the file contents),
                     /// so it does not have to be written again. This terminates: every iteration
                     /// strictly increases the region size, which is capped by shared_memory_max_size.
                     UInt64 requested_size = 0;
@@ -3077,7 +3074,7 @@ namespace
             /// did not know of them would let the growth take the footprint past the cap and find
             /// out afterwards. One `fstat` per growth, and growths are amortized. A region whose
             /// footprint cannot be read is not handed to the next borrow (see below).
-            size_t footprint_before;
+            size_t footprint_before = 0;
             try
             {
                 footprint_before = region.refreshFootprint();
@@ -3140,7 +3137,7 @@ namespace
                 /// If the footprint cannot be refreshed, retain the conservative charge and
                 /// preserve the growth failure that brought us here.
                 const auto growth_exception = std::current_exception();
-                size_t footprint_after;
+                size_t footprint_after = 0;
                 try
                 {
                     footprint_after = region.refreshFootprint();
@@ -4189,6 +4186,7 @@ Pipe ShellCommandSourceCoordinator::createPipe(
                     process->getPid(),
                     leftover_stderr);
 
+            process->discardWithoutGrace();
             process.reset();
             process = process_holder->buildCommand();
             worker_is_reused = false;
@@ -4213,6 +4211,7 @@ Pipe ShellCommandSourceCoordinator::createPipe(
                 leftover_stderr.empty() ? "" : " Stderr: ",
                 leftover_stderr);
 
+            process->discardWithoutGrace();
             process.reset();
             process = process_holder->buildCommand();
             worker_is_reused = false;
@@ -4237,6 +4236,7 @@ Pipe ShellCommandSourceCoordinator::createPipe(
                 process->getPid(),
                 leftover_stderr);
 
+            process->discardWithoutGrace();
             process.reset();
             process = process_holder->buildCommand();
             worker_is_reused = false;
@@ -4349,7 +4349,8 @@ Pipe ShellCommandSourceCoordinator::createPipe(
         source_configuration,
         std::move(process_holder),
         process_pool,
-        worker_is_reused);
+        worker_is_reused,
+        configuration.is_user_defined_function);
 
     return Pipe(std::move(source));
 }

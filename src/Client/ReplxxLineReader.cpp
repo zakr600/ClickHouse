@@ -100,6 +100,9 @@ int executeCommand(char * const argv[])
     /// Child
     if (0 == pid)
     {
+        /// Only `sigemptyset` and `sigprocmask` before `exec`: async-signal-safe, touching nothing the parent
+        /// shares - as `posix_spawn` does in its own child.
+        /// NOLINTBEGIN(clang-analyzer-unix.Vfork)
         sigset_t mask;
         sigemptyset(&mask);
         sigprocmask(0, nullptr, &mask); // NOLINT(concurrency-mt-unsafe) // ok in newly created process
@@ -107,6 +110,7 @@ int executeCommand(char * const argv[])
 
         execvp(argv[0], argv);
         _exit(-1);
+        /// NOLINTEND(clang-analyzer-unix.Vfork)
     }
 
     int status = 0;

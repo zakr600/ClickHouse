@@ -12,7 +12,10 @@ trap 'rm -rf "$WORK"' EXIT
 printf '#!/usr/bin/env bash\necho row\nexec 1>&- 2>&-\nsleep 2\n' > "$WORK/command.sh"
 chmod +x "$WORK/command.sh"
 
-# Denial of `pidfd_open` must report an error, not keep retrying until the child exits.
+# A denial of `pidfd_open` (a seccomp profile of an older container runtime) is not an error of the
+# command: the wait for its exit goes on in short steps, as on a kernel without `pidfd`. The command
+# closes its stdout and stderr before it exits, so the wait gets to the point where only the exit is
+# left to wait for.
 python3 - "$CLICKHOUSE_LOCAL" "$WORK" <<'PY'
 import ctypes
 import errno
@@ -62,6 +65,6 @@ result = subprocess.run(
     shlex.split(sys.argv[1]) + ["--query", query, "--", "--user_scripts_path=" + sys.argv[2]],
     preexec_fn=deny_pidfd, capture_output=True, text=True, timeout=30,
 )
-assert result.returncode != 0 and "(CANNOT_WAITPID)" in result.stderr, result
-print("wait failure reported")
+assert result.returncode == 0 and result.stdout == "row\n", result
+print("waited without pidfd")
 PY

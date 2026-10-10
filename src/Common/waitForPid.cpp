@@ -8,7 +8,7 @@
 #include <base/scope_guard.h>
 
 #include <fcntl.h>
-#include <signal.h>
+#include <csignal>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -86,33 +86,37 @@ static bool supportsPidFdOpen()
     return linux_version >= pidfd_open_minimal_version;
 }
 
+/// Without a `pidfd` there is nothing to wait on: a `/proc/<pid>` directory is always ready for
+/// `poll`, so polling it waits for nothing, and whether the process is there at all the caller has
+/// just found out (`checkPidExited`). Wait a short step, and let it look again.
+static PollPidResult waitStepWithoutPidFd(int timeout_in_ms)
+{
+    static constexpr int no_pidfd_step_ms = 5;
+    if (poll(nullptr, 0, std::min(timeout_in_ms, no_pidfd_step_ms)) < 0 && errno != EINTR)
+        return PollPidResult::FAILED;
+    return PollPidResult::RESTART;
+}
+
 static PollPidResult pollPid(pid_t pid, int timeout_in_ms)
 {
-    int pid_fd = 0;
+    if (!supportsPidFdOpen())
+        return waitStepWithoutPidFd(timeout_in_ms);
 
-    if (supportsPidFdOpen())
+    // pidfd_open cannot be interrupted, no EINTR handling
+    int pid_fd = syscall_pidfd_open(pid);
+
+    if (pid_fd < 0)
     {
-        // pidfd_open cannot be interrupted, no EINTR handling
+        if (errno == ESRCH)
+            return PollPidResult::RESTART;
 
-        pid_fd = syscall_pidfd_open(pid);
+        /// Refused rather than failed: a seccomp profile (older container runtimes deny
+        /// `pidfd_open`) or a kernel built without it. The process is there all the same, and
+        /// it is waited for as on a kernel that has no `pidfd` at all.
+        if (errno == EPERM || errno == EACCES || errno == ENOSYS)
+            return waitStepWithoutPidFd(timeout_in_ms);
 
-        if (pid_fd < 0)
-        {
-            if (errno == ESRCH)
-                return PollPidResult::RESTART;
-
-            return PollPidResult::FAILED;
-        }
-    }
-    else
-    {
-        /// Without a `pidfd` there is nothing to wait on: a `/proc/<pid>` directory is always ready
-        /// for `poll`, so polling it waits for nothing, and whether the process is there at all the
-        /// caller has just found out (`checkPidExited`). Wait a short step, and let it look again.
-        static constexpr int no_pidfd_step_ms = 5;
-        if (poll(nullptr, 0, std::min(timeout_in_ms, no_pidfd_step_ms)) < 0 && errno != EINTR)
-            return PollPidResult::FAILED;
-        return PollPidResult::RESTART;
+        return PollPidResult::FAILED;
     }
 
     /// Releases pid_fd on every return path, including poll timeout and error.

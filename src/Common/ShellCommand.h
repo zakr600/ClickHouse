@@ -120,6 +120,17 @@ public:
         return wait_called;
     }
 
+    /// Ends the grace period `command_termination_timeout` gives the command to exit on its own:
+    /// the destructor then signals it at once instead of waiting. For a command that is thrown away
+    /// with nobody interested in how it exits - a pooled worker found unfit before it is lent out -
+    /// so that whoever drops it does not sit out the timeout on a command that ignores stdin EOF.
+    void endTerminationGracePeriod() noexcept;
+
+    /// For a command that is thrown away with nobody interested in how it exits: no grace period
+    /// (`endTerminationGracePeriod`), and the destructor kills it with `SIGKILL` and reaps it,
+    /// rather than sending `termination_signal` and leaving it to exit - and stay a zombie - on its own.
+    void discardWithoutGrace() noexcept;
+
     /// Closes every descriptor the command reads its input from: its `stdin` and the extra
     /// `write_fds` of a command that was given more than one input (`executable` with several
     /// input queries). A command is written to exit when its inputs reach EOF, so a teardown that
@@ -263,6 +274,9 @@ private:
     /// somebody else, so it is neither signalled nor waited for.
     bool child_reaped = false;
 
+    /// Set by `discardWithoutGrace`.
+    bool discard_without_grace = false;
+
     /// Records that the child has been reaped or is not a child of this process any more
     /// (`child_reaped`): from then on it is neither waited for nor signalled - `wait_called` is set
     /// too, which is what the destructor looks at - and it leaves `UDFProcessRegistry`, whose
@@ -304,7 +318,10 @@ private:
 
     ShellCommand(pid_t pid_, int & in_fd_, int & out_fd_, int & err_fd_, const Config & config);
 
-    bool tryWaitProcessWithTimeout(size_t timeout_in_seconds);
+    bool tryWaitProcessWithTimeout(size_t timeout_in_milliseconds);
+
+    /// Sends `SIGKILL` to the child and reaps it (`discardWithoutGrace`).
+    void killAndReapNoThrow() noexcept;
     struct tryWaitResult;
 
     /// `close_streams = false` leaves the child's pipes open after it has been reaped. Only
@@ -329,6 +346,8 @@ private:
     /// bounded - within a hard cap of `max_total_ms`, for a grandchild that keeps the pipe fed.
     /// `stdout_bytes_drained`, if given, is increased by the number of bytes taken off `stdout`.
     /// `check_cancelled`, if given, is called on every step and may throw to stop the drain.
+    /// `exit_fd`, if given, is the child's `pidfd`: the drain returns as soon as the child exits,
+    /// and waits for that instead of coming back in short steps.
     void drainOutputPipes(
         int (&drain_fds)[2],
         const StderrSink & stderr_sink,
@@ -336,7 +355,11 @@ private:
         bool budget_is_quiet_time = false,
         UInt64 max_total_ms = 0,
         size_t * stdout_bytes_drained = nullptr,
-        const std::function<void()> & check_cancelled = {}) const;
+        const std::function<void()> & check_cancelled = {},
+        int exit_fd = -1) const;
+
+    /// Whether both output pipes still in `drain_fds` have hung up with nothing left to read.
+    bool outputPipesHaveEnded(const int (&drain_fds)[2]) const;
 
     void handleProcessRetcode(int retcode) const;
 

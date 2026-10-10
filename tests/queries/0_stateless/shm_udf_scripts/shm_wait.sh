@@ -8,6 +8,7 @@
 #
 #   shm_wait.sh blocked        - the process is blocked in `write` on a full pipe nobody reads
 #   shm_wait.sh exited         - the process has exited (a zombie for its parent to reap, or gone)
+#   shm_wait.sh reaped         - the process is gone altogether: exited and reaped, not a zombie
 #   shm_wait.sh file <path>    - the file exists; it is removed once seen, so that a command that
 #                                creates it again can be waited for again (the pid on stdin is not used)
 #   shm_wait.sh touch <path>   - not a wait: creates the file - the signal a command waits for in
@@ -29,6 +30,9 @@ for _ in $(seq 1 160); do
         exited)
             stat=$(cat /proc/"$pid"/stat 2>/dev/null)
             [[ -z "$stat" || "${stat##*) }" == Z* ]] && echo 1 && exit 0
+            ;;
+        reaped)
+            [[ ! -e /proc/"$pid" ]] && echo 1 && exit 0
             ;;
         file)
             rm "$2" 2>/dev/null && echo 1 && exit 0

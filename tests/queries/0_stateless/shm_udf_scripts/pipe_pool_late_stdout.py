@@ -9,9 +9,11 @@
 # wrong answer, which is exactly what a borrow must refuse to start on.
 #
 # The file named by `--marker` is created once the row is on the pipe, so that the test borrows the
-# worker again only then.
+# worker again only then. With `--linger` the command does not exit on stdin EOF after that, and stays
+# until it is killed.
 import os
 import sys
+import time
 
 # CI runs Python with `PYTHONSAFEPATH`, which keeps the script's own directory out of `sys.path`.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -29,3 +31,6 @@ if __name__ == "__main__":
             sys.stdout.flush()
             with open(marker, "w"):
                 pass
+            if "--linger" in sys.argv:
+                while True:
+                    time.sleep(1)

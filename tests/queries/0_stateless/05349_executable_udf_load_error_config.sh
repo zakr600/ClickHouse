@@ -8,8 +8,10 @@ set -e
 CONFIG_DIR=$(mktemp -d "${CLICKHOUSE_TMP}/udf_failed_config_XXXXXX")
 trap 'rm -rf "$CONFIG_DIR"' EXIT
 
-# Failure before the loader constructs a function must not invent an `executable` type
-# or pipe transport for the configured `executable_pool` with `use_shared_memory`.
+# A function that failed to load has no configuration to report. The columns that predate the
+# shared-memory transport keep their types and show their defaults, as they always have (`load_status`
+# says they mean nothing). The columns added with the transport are `NULL`, so that a failed
+# `executable_pool` with `use_shared_memory` does not look like one configured for the pipes.
 cat > "$CONFIG_DIR/functions.xml" <<'XML'
 <functions>
     <function>
@@ -51,10 +53,12 @@ $CLICKHOUSE_LOCAL --query "
     FROM system.user_defined_functions ORDER BY name;
 
     SELECT NOT empty(loading_error_message),
-        arrayAll(x -> isNull(x), [command, format, return_type, return_name, stderr_reaction]),
-        arrayAll(x -> isNull(x), [max_command_execution_time, command_termination_timeout,
+        arrayAll(x -> empty(x), [command, format, return_type, return_name]),
+        arrayAll(x -> x = 0, [max_command_execution_time, command_termination_timeout,
             command_read_timeout, command_write_timeout, pool_size, send_chunk_header,
-            execute_direct, lifetime, deterministic, check_exit_code, use_shared_memory,
+            execute_direct, lifetime, deterministic]),
+        isNull(stderr_reaction),
+        arrayAll(x -> isNull(x), [check_exit_code, use_shared_memory,
             shared_memory_size, shared_memory_max_size, command_pipe_capacity]),
         argument_types, argument_names
     FROM system.user_defined_functions WHERE name = 'failed_pool';
