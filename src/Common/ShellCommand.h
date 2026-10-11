@@ -120,14 +120,18 @@ public:
         return wait_called;
     }
 
-    /// For a command that is thrown away: once the grace period is over, the destructor kills it
-    /// with `SIGKILL` and reaps it, rather than sending `termination_signal` and leaving it to exit -
-    /// and stay a zombie, with its pid in `UDFProcessRegistry` - on its own. A command written to
-    /// exit on stdin EOF still gets the grace period to do so.
-    void reapOnDestruction() noexcept { reap_on_destruction = true; }
+    /// What is pending on the pipe `fd` reads from right now, as `poll` revents: a probe that never
+    /// waits and never throws. A failed `poll` is logged and answered as `POLLERR`, which every caller
+    /// reads as a reason not to build on the process - the fail-closed side.
+    static Int16 pendingEvents(int fd) noexcept;
 
-    /// The same, without the grace period (`endTerminationGracePeriod`): for a command nobody is
-    /// interested in how it exits.
+    /// Whether the write end of the pipe `fd` reads from is closed, with nothing left to read.
+    static bool pipeHasEnded(int fd) noexcept;
+
+    /// For a command thrown away with nobody interested in how it exits - a pooled worker found
+    /// unfit before anything was sent to it, on the thread of a query that did not cause it: no
+    /// grace period (`endTerminationGracePeriod`), and the destructor kills it with `SIGKILL` and
+    /// reaps it rather than sending `termination_signal`.
     void discardWithoutGrace() noexcept;
 
     /// Closes every descriptor the command reads its input from: its `stdin` and the extra
@@ -277,8 +281,11 @@ private:
     /// somebody else, so it is neither signalled nor waited for.
     bool child_reaped = false;
 
-    /// Set by `reapOnDestruction` and `discardWithoutGrace`.
+    /// Set by `discardWithoutGrace`.
     bool reap_on_destruction = false;
+
+    /// Set by `killAndReapNoThrow`, which runs once.
+    bool kill_and_reap_done = false;
 
     /// Records that the child has been reaped or is not a child of this process any more
     /// (`child_reaped`): from then on it is neither waited for nor signalled - `wait_called` is set
@@ -340,29 +347,29 @@ private:
     /// Closes everything `tryWaitImpl` would have closed on a reap.
     void closeStreams();
 
+    /// The same without throwing, each stream on its own: for the destructor's path.
+    void closeStreamsNoThrow() noexcept;
+
     /// Reads both output pipes until they end or `budget_ms` runs out, handing what comes off
     /// stderr to `stderr_sink`. Does not reap and does not touch the termination deadline.
     /// Reads exactly the bytes the pipes hold at this moment (`FIONREAD`), with no deadline: they
     /// are there, so the reads cannot block, and nothing may cost them - see `waitDrainingOutput`.
-    void readBufferedOutput(int (&drain_fds)[2], const StderrSink & stderr_sink) const;
+    /// `stdout_bytes_drained`, if given, is increased by what is taken off `stdout`, as by `drainOutputPipes`.
+    void readBufferedOutput(int (&drain_fds)[2], const StderrSink & stderr_sink, size_t * stdout_bytes_drained = nullptr) const;
 
-    /// Reads what the pipes hold, for at most `budget_ms`. With `budget_is_quiet_time` the budget
-    /// is spent only while nothing arrives: every read pushes the deadline forward, so what is
-    /// already in the pipes is read whole however long that takes, and only the wait for more is
-    /// bounded - within a hard cap of `max_total_ms`, for a grandchild that keeps the pipe fed.
-    /// `stdout_bytes_drained`, if given, is increased by the number of bytes taken off `stdout`.
-    /// `check_cancelled`, if given, is called on every step and may throw to stop the drain.
-    /// `exit_fd`, if given, is the child's `pidfd`: the drain returns as soon as the child exits,
-    /// and waits for that instead of coming back in short steps.
+    /// Reads what the pipes hold, for at most `budget_ms`, handing what comes off stderr to
+    /// `stderr_sink`. `stdout_bytes_drained`, if given, is increased by what is taken off `stdout`.
+    /// `exit_fd`, if given, is the child's `pidfd`: the drain returns as soon as the child exits, and
+    /// waits for that instead of coming back in short steps.
     void drainOutputPipes(
-        int (&drain_fds)[2],
-        const StderrSink & stderr_sink,
-        UInt64 budget_ms,
-        bool budget_is_quiet_time = false,
-        UInt64 max_total_ms = 0,
-        size_t * stdout_bytes_drained = nullptr,
-        const std::function<void()> & check_cancelled = {},
-        int exit_fd = -1) const;
+        int (&drain_fds)[2], const StderrSink & stderr_sink, UInt64 budget_ms, size_t * stdout_bytes_drained, int exit_fd) const;
+
+    /// One `read` of `drain_fds[i]` (0 is stdout, 1 is stderr) into `buffer`, retried on `EINTR`:
+    /// what it takes goes to `stderr_sink` or is counted into `stdout_bytes_drained`. Returns the
+    /// bytes read; on EOF or an error that will not go away the descriptor is dropped from
+    /// `drain_fds`, on `EAGAIN` it is kept.
+    size_t readPipeOnce(
+        int (&drain_fds)[2], size_t i, char * buffer, size_t size, const StderrSink & stderr_sink, size_t * stdout_bytes_drained) const;
 
     /// Whether both output pipes still in `drain_fds` have hung up with nothing left to read.
     bool outputPipesHaveEnded(const int (&drain_fds)[2]) const;

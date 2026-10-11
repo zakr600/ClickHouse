@@ -2,6 +2,7 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <string_view>
 
 #include <base/BorrowedObjectPool.h>
@@ -37,6 +38,12 @@ inline constexpr std::array<std::string_view, 3> SHARED_MEMORY_CONFIGURATION_KEY
     "shared_memory_size",
     "shared_memory_max_size",
 };
+
+/// The first of the options above that appears under `config_prefix`, if any; without `use_shared_memory`
+/// itself when `except_the_switch` - for a surface that has the transport and finds it switched off,
+/// where `use_shared_memory` may legitimately be spelled out as `0`.
+std::optional<std::string_view> findSharedMemoryConfigurationKey(
+    const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix, bool except_the_switch);
 
 /// Throws if any of the options above appears under `config_prefix`. For a surface that does not
 /// implement the shared-memory transport at all: without this, a command that was explicitly
@@ -125,11 +132,11 @@ public:
         /// The pipes then carry only control commands (see ShellCommandSource.cpp).
         bool use_shared_memory = false;
 
-        /// Initial size in bytes of the shared-memory region. Valid only if use_shared_memory = true.
+        /// Initial size in bytes of the shared-memory region. Valid only if `use_shared_memory = true`.
         size_t shared_memory_size = 0;
 
         /// Upper bound in bytes to which the region may grow on demand. When it equals
-        /// shared_memory_size the region never grows. Valid only if use_shared_memory = true.
+        /// `shared_memory_size` the region never grows. Valid only if `use_shared_memory = true`.
         size_t shared_memory_max_size = 0;
 
 

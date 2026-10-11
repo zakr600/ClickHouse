@@ -417,7 +417,7 @@ TEST(SharedMemoryRegion, GrowThatCommitsButCannotMapKeepsMappingAndReportsBackin
 
 /// The seals stop the command from shrinking the file, not from extending it. Pages it adds that
 /// way are not the server's doing, but they are the server's cost, so the region reports them once
-/// asked to look (`refreshBackingSize`) - and a later growth of the server's own must commit the
+/// asked to look (`refreshFootprint`) - and a later growth of the server's own must commit the
 /// tail the command left sparse before mapping it, or writing into it could fail under memory
 /// pressure with the one signal the whole design exists to avoid.
 TEST(SharedMemoryRegion, CommandExtendingTheFileIsSeenAndItsTailIsCommittedOnGrowth)
@@ -437,7 +437,8 @@ TEST(SharedMemoryRegion, CommandExtendingTheFileIsSeenAndItsTailIsCommittedOnGro
 
     /// The cached figure does not know; the re-read does. The mapping is untouched either way.
     EXPECT_EQ(region.backingSize(), page);
-    EXPECT_EQ(region.refreshBackingSize(), grown);
+    region.refreshFootprint();
+    EXPECT_EQ(region.backingSize(), grown);
     EXPECT_EQ(region.backingSize(), grown);
     EXPECT_EQ(region.size(), page);
 
@@ -492,7 +493,8 @@ TEST(SharedMemoryRegion, HolePunchedByTheCommandIsNotASigbus)
     EXPECT_EQ(region.data()[9 * page], 'x');
     region.data()[page] = 'y';
     EXPECT_EQ(region.data()[page], 'y');
-    EXPECT_EQ(region.refreshBackingSize(), size);
+    region.refreshFootprint();
+    EXPECT_EQ(region.backingSize(), size);
 }
 
 /// The seals stop the file getting shorter, not pages being committed past its end: `fallocate`
@@ -509,7 +511,8 @@ TEST(SharedMemoryRegion, PagesCommittedPastTheEndOfTheFileShowInTheFootprintButN
     /// What a command could do through its inherited descriptor.
     ASSERT_EQ(::fallocate(region.fd(), FALLOC_FL_KEEP_SIZE, static_cast<off_t>(size), static_cast<off_t>(2 * size)), 0);
 
-    EXPECT_EQ(region.refreshBackingSize(), size);
+    region.refreshFootprint();
+    EXPECT_EQ(region.backingSize(), size);
     EXPECT_EQ(region.size(), size);
     EXPECT_GE(region.refreshFootprint(), 3 * size);
     EXPECT_EQ(region.footprint(), region.refreshFootprint());
@@ -517,7 +520,8 @@ TEST(SharedMemoryRegion, PagesCommittedPastTheEndOfTheFileShowInTheFootprintButN
     /// And the other way round: a sparse tail is length without pages, and the footprint is the
     /// length then.
     ASSERT_EQ(::ftruncate(region.fd(), static_cast<off_t>(8 * size)), 0);
-    EXPECT_EQ(region.refreshBackingSize(), 8 * size);
+    region.refreshFootprint();
+    EXPECT_EQ(region.backingSize(), 8 * size);
     EXPECT_EQ(region.refreshFootprint(), 8 * size);
 
     /// A growth into pages that are already there adds nothing to the footprint.
@@ -569,7 +573,8 @@ TEST(SharedMemoryRegion, FootprintIsInWholePages)
     EXPECT_GE(page, 4096u);
     EXPECT_EQ(region.footprint(), page);
     EXPECT_EQ(region.refreshFootprint(), page);
-    EXPECT_EQ(region.refreshBackingSize(), 16u);
+    region.refreshFootprint();
+    EXPECT_EQ(region.backingSize(), 16u);
     EXPECT_EQ(SharedMemoryRegion::roundUpToPages(16), page);
     EXPECT_EQ(SharedMemoryRegion::roundUpToPages(page), page);
     EXPECT_EQ(SharedMemoryRegion::roundUpToPages(page + 1), 2 * page);

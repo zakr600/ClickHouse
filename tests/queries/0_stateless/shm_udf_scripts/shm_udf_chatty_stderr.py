@@ -18,22 +18,9 @@ import mmap
 import os
 import sys
 
-PROTOCOL_VERSION = 1
-STATUS_OK = 0
-
-
-def read_varint(stream):
-    result = 0
-    shift = 0
-    while True:
-        chunk = stream.read(1)
-        if not chunk:
-            return None
-        byte = chunk[0]
-        result |= (byte & 0x7F) << shift
-        if not (byte & 0x80):
-            return result
-        shift += 7
+# CI runs Python with `PYTHONSAFEPATH`, which keeps the script's own directory out of `sys.path`.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from shm_protocol import PROTOCOL_VERSION, STATUS_OK, read_varint  # noqa: E402
 
 
 def encode_varint(value):

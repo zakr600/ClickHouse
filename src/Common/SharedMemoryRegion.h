@@ -26,7 +26,7 @@ namespace DB
   * What the seal does not do is worth stating just as plainly, because it draws the line of what
   * this class promises. It stops the file getting shorter; it does not stop the command from
   * extending it (only the server's growth could be allowed, and seals do not tell the two apart -
-  * see `refreshBackingSize`), and it does not stop the command from freeing pages inside it with
+  * see `refreshFootprint`), and it does not stop the command from freeing pages inside it with
   * `fallocate(FALLOC_FL_PUNCH_HOLE)` or `madvise(MADV_REMOVE)`, which the kernel refuses only
   * under `F_SEAL_WRITE` - a seal the command cannot live with, its output goes into the file.
   * A punched-out page remains inside the file, but its next access must allocate it again.
@@ -130,7 +130,7 @@ public:
 
     /// The length of the file as last seen: never less than `size`, and greater after a growth
     /// that committed its pages but could not map them - or after the command extended the file
-    /// (see `refreshBackingSize`). This is what the region costs, so memory accounting goes by this
+    /// (see `refreshFootprint`). This is what the region costs, so memory accounting goes by this
     /// figure, not by `size`.
     size_t backingSize() const { return backing_size; }
 
@@ -169,19 +169,6 @@ public:
         const size_t footprint_after = target + past_the_end_at_least;
         return footprint_after > footprint_size ? footprint_after - footprint_size : 0;
     }
-
-    /** Re-reads the length of the file and returns it, updating `backingSize`.
-      *
-      * The seals stop the command from shrinking the file; nothing stops it from extending it,
-      * since only the server's own growth can be allowed and seals do not tell the two apart. A
-      * command has no reason to (a result that does not fit is asked for through the protocol),
-      * but one that does holds pages the server knows nothing about. So the size is read back
-      * from the file wherever the region's charge changes hands - when a borrow starts and when
-      * the worker goes back into the pool - and the larger figure is charged from then on. Between
-      * those points the cached figure is used; a command extending the file mid-borrow is charged
-      * at the next hand-over, not never.
-      */
-    size_t refreshBackingSize();
 
     /** Re-reads the file and returns what it costs: the larger of its length and the pages it has
       * committed (`st_blocks`), updating `backingSize` on the way.

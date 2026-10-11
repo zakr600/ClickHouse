@@ -5,7 +5,7 @@
 #
 # It runs each variant against a throw-away server (see lib.sh for why not clickhouse-local),
 # reports the median query time over several iterations and the amount of data that crossed the
-# kernel via read()/write() syscalls (OSReadChars / OSWriteChars) — the latter is a
+# kernel via `read`/`write` syscalls (`OSReadChars` / `OSWriteChars`) — the latter is a
 # build-independent structural metric of the transport.
 #
 # Usage:

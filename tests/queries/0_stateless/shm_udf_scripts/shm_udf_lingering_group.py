@@ -24,10 +24,17 @@ import time
 import os
 import sys
 
-PROTOCOL_VERSION = 1
-STATUS_OK = 0
-STATUS_ERROR = 1
-STATUS_NEED_MORE_SPACE = 2
+# CI runs Python with `PYTHONSAFEPATH`, which keeps the script's own directory out of `sys.path`.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from shm_protocol import (  # noqa: E402
+    PROTOCOL_VERSION,
+    STATUS_ERROR,
+    STATUS_NEED_MORE_SPACE,
+    STATUS_OK,
+    read_varint,
+    write_string_binary,
+    write_varint,
+)
 
 
 class NeedMoreSpace(Exception):
@@ -36,20 +43,6 @@ class NeedMoreSpace(Exception):
             f"the shared-memory region must be at least {required_size} bytes"
         )
         self.required_size = required_size
-
-
-def read_varint(stream):
-    result = 0
-    shift = 0
-    while True:
-        chunk = stream.read(1)
-        if not chunk:
-            return None
-        byte = chunk[0]
-        result |= (byte & 0x7F) << shift
-        if not (byte & 0x80):
-            return result
-        shift += 7
 
 
 def encode_varint(value):
@@ -63,25 +56,6 @@ def encode_varint(value):
             out.append(byte)
             break
     return bytes(out)
-
-
-def write_varint(stream, value):
-    out = bytearray()
-    while True:
-        byte = value & 0x7F
-        value >>= 7
-        if value:
-            out.append(byte | 0x80)
-        else:
-            out.append(byte)
-            break
-    stream.write(bytes(out))
-
-
-def write_string_binary(stream, text):
-    encoded = text.encode("utf-8")
-    write_varint(stream, len(encoded))
-    stream.write(encoded)
 
 
 def process(input_data, region, region_size):

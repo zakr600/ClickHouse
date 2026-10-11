@@ -3,18 +3,23 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
 #include <limits>
+#include <optional>
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <IO/ReadBufferFromFile.h>
+#include <IO/ReadHelpers.h>
 #include <Common/Exception.h>
 #include <Common/ErrnoException.h>
 #include <Common/LockMemoryExceptionInThread.h>
@@ -22,6 +27,7 @@
 #include <Common/logger_useful.h>
 #include <base/defines.h>
 #include <base/errnoToString.h>
+#include <base/getPageSize.h>
 #include <base/scope_guard.h>
 
 #include <fmt/format.h>
@@ -73,7 +79,7 @@ namespace
 /// the one thing that would turn an access into a `SIGBUS`. `F_SEAL_SEAL` keeps it from adding
 /// seals of its own - `F_SEAL_GROW` would break the server's growth, `F_SEAL_WRITE` its writes.
 /// Nothing here stops the command from extending the file or from punching holes in it: the
-/// former is measured at every hand-over (`refreshBackingSize`), the latter is the command's own
+/// former is measured at every hand-over (`refreshFootprint`), the latter is the command's own
 /// loss (the class comment states the contract); neither can crash the server.
 constexpr int REGION_SEALS = F_SEAL_SHRINK | F_SEAL_SEAL;
 
@@ -91,6 +97,9 @@ void closeNoThrow(int fd, const char * operation) noexcept
     if (0 != ::close(fd))
     {
         const int close_errno = errno;
+        /// The message allocates, and these run where an exception cannot leave: in `SCOPE_EXIT` and
+        /// in destructors, usually while the query is at its memory limit.
+        LockMemoryExceptionInThread block_exceptions(VariableContext::Global);
         LOG_WARNING(
             getLogger("SharedMemoryRegion"),
             "Cannot close a shared-memory region descriptor during {}: {}",
@@ -111,11 +120,31 @@ void observeBackingUnit(size_t bytes)
     }
 }
 
-/// `posix_fallocate` of the file up to `size`, retried on `EINTR` (see `reserveBackingStorage`).
-/// Returns the error, which `posix_fallocate` returns rather than sets in `errno`; 0 on success.
+/// `posix_fallocate` of the file up to `size`. Returns the error, which `posix_fallocate` returns
+/// rather than sets in `errno`; 0 on success.
+///
+/// Before Linux 6.12 `shmem_fallocate` gives up on *any* pending signal (`signal_pending`), not only
+/// a fatal one, and undoes every page it had committed - so a retry starts from the beginning, and a
+/// region that takes longer to commit than the period of a timer signal aimed at this thread (the
+/// query profiler's) would never be committed at all: every attempt is interrupted. So once an
+/// attempt has been interrupted, the retries run with every signal blocked in this thread; such a
+/// signal stays pending and is delivered once the call returns, and only a fatal one, which cannot be
+/// blocked, still interrupts it - and then the retry is moot. Not blocked up front: the commit can
+/// take seconds for a large region, and signals the server aims at this thread (the profiler's, the
+/// stack-trace collection of `system.stack_trace`) would wait that long - on a recent kernel, and on
+/// an old one that is not interrupted, for nothing.
 int fallocateUpTo(int fd, size_t size)
 {
-    int fallocate_error = 0;
+    int fallocate_error = ::posix_fallocate(fd, 0, static_cast<off_t>(size));
+    if (fallocate_error != EINTR)
+        return fallocate_error;
+
+    sigset_t all_signals;
+    sigset_t previous_signals;
+    sigfillset(&all_signals);
+    pthread_sigmask(SIG_BLOCK, &all_signals, &previous_signals);
+    SCOPE_EXIT({ pthread_sigmask(SIG_SETMASK, &previous_signals, nullptr); });
+
     do
         fallocate_error = ::posix_fallocate(fd, 0, static_cast<off_t>(size));
     while (fallocate_error == EINTR);
@@ -125,7 +154,7 @@ int fallocateUpTo(int fd, size_t size)
 /// Frees every page of the file, inside its length and past it. 0 on success, -1 with `errno` set.
 int punchWholeFile(int fd)
 {
-    const off_t page_size = static_cast<off_t>(::sysconf(_SC_PAGESIZE));
+    const off_t page_size = static_cast<off_t>(getPageSize());
     const off_t whole_file = std::numeric_limits<off_t>::max() / page_size * page_size;
     return ::fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, whole_file);
 }
@@ -143,6 +172,8 @@ void releasePagesNoThrow(int fd) noexcept
     if (0 != punchWholeFile(fd))
     {
         const int punch_errno = errno;
+        /// As in `closeNoThrow`.
+        LockMemoryExceptionInThread block_exceptions(VariableContext::Global);
         LOG_WARNING(
             getLogger("SharedMemoryRegion"),
             "Cannot free the pages of a shared-memory region on its destruction; they stay until the last "
@@ -156,6 +187,8 @@ void unmapNoThrow(void * data, size_t size, const char * operation) noexcept
     if (0 != ::munmap(data, size))
     {
         const int munmap_errno = errno;
+        /// As in `closeNoThrow`.
+        LockMemoryExceptionInThread block_exceptions(VariableContext::Global);
         LOG_WARNING(
             getLogger("SharedMemoryRegion"),
             "Cannot unmap a shared-memory region of {} during {}: {}",
@@ -170,11 +203,9 @@ void unmapNoThrow(void * data, size_t size, const char * operation) noexcept
 /// there is no separate `ftruncate` whose effect would have to be rolled back - and could not be,
 /// on a file sealed against shrinking.
 ///
-/// It is retried on `EINTR`, as a matter of form more than of need: `shmem_fallocate` checks only
-/// for a *fatal* pending signal (`fatal_signal_pending`), so the query profiler's timers do not
-/// interrupt it, and a call that was interrupted unwinds the pages it had allocated (`undo`), so
-/// a retry starts over rather than closer to the end. Note that `posix_fallocate` reports its
-/// error by returning it, not through `errno`.
+/// A call that was interrupted unwinds the pages it had allocated (`undo`), so a retry starts over
+/// rather than closer to the end - which is why `fallocateUpTo` retries with signals blocked. Note that
+/// `posix_fallocate` reports its error by returning it, not through `errno`.
 ///
 /// The mount behind a `memfd` has no size limit, so the kernel does not refuse an oversized
 /// request up front: it keeps committing pages until the machine has none left. The only guard is
@@ -214,7 +245,7 @@ void SharedMemoryRegion::checkSupported()
     /// too fails at configuration time rather than on every call. Whatever the reason, it is
     /// reported as the transport being unavailable here - this is a probe, and a refusal of one
     /// page is not the machine running out of memory.
-    const int fallocate_error = fallocateUpTo(fd, static_cast<size_t>(::sysconf(_SC_PAGESIZE)));
+    const int fallocate_error = fallocateUpTo(fd, static_cast<size_t>(getPageSize()));
     if (fallocate_error != 0)
         ErrnoException::throwWithErrno(
             ErrorCodes::NOT_IMPLEMENTED,
@@ -246,6 +277,9 @@ void SharedMemoryRegion::checkSupported()
         ErrnoException::throwWithErrno(ErrorCodes::NOT_IMPLEMENTED, saved_errno, "Cannot fstat the shared-memory region probe");
     }
     observeBackingUnit(static_cast<size_t>(probe_stat.st_blocks) * 512);
+    /// The `/sys` part is read now, once, so that a knob that cannot be read or parsed fails the load
+    /// of the function rather than a query.
+    roundUpToPages(0);
 
     if (0 != ::fcntl(fd, F_ADD_SEALS, REGION_SEALS))
     {
@@ -419,7 +453,8 @@ void SharedMemoryRegion::grow(size_t new_size)
 
 size_t SharedMemoryRegion::releasePagesUpToLength()
 {
-    const size_t length = refreshBackingSize();
+    refreshFootprint();
+    const size_t length = backing_size;
     const off_t range = static_cast<off_t>(roundUpToPages(length));
     if (0 != ::fallocate(region_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, range))
     {
@@ -439,21 +474,6 @@ void SharedMemoryRegion::recommitUpToLength()
 {
     reserveBackingStorage(region_fd, backing_size, "recommit");
     reserved_size = std::max(reserved_size, backing_size);
-}
-
-size_t SharedMemoryRegion::refreshBackingSize()
-{
-    struct stat st{};
-    if (0 != ::fstat(region_fd, &st))
-    {
-        const int saved_errno = errno;
-        ErrnoException::throwWithErrno(ErrorCodes::CANNOT_FCNTL, saved_errno, "SharedMemoryRegion: Cannot fstat the region");
-    }
-
-    /// Never below what is known: the seals make a shorter file impossible, so a smaller figure
-    /// here would be a bug, not a fact.
-    backing_size = std::max(backing_size, static_cast<size_t>(st.st_size));
-    return backing_size;
 }
 
 size_t SharedMemoryRegion::refreshFootprint()
@@ -480,24 +500,16 @@ size_t SharedMemoryRegion::refreshFootprint()
 namespace
 {
 
-/// Reads a small sysfs file into `out`; false if it cannot be read.
-bool readSysfsLine(const std::string & path, std::string & out)
+/// The first line of a sysfs file, or nothing if the kernel has no such file: a knob it does not
+/// have. A file that is there and cannot be read is an error.
+std::optional<std::string> readSysfsLine(const std::string & path)
 {
-    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd == -1)
-        return false;
-    SCOPE_EXIT({ closeNoThrow(fd, "sysfs probe"); });
-
-    char buffer[256];
-    ssize_t bytes = 0;
-    do
-        bytes = ::read(fd, buffer, sizeof(buffer) - 1);
-    while (bytes == -1 && errno == EINTR);
-    if (bytes <= 0)
-        return false;
-
-    out.assign(buffer, static_cast<size_t>(bytes));
-    return true;
+    if (!std::filesystem::exists(path))
+        return std::nullopt;
+    ReadBufferFromFile in(path);
+    std::string line;
+    readStringUntilNewlineInto(line, in);
+    return line;
 }
 
 bool isAlwaysOrForce(const std::string & mode)
@@ -518,18 +530,19 @@ bool isAlwaysOrForce(const std::string & mode)
 /// kernel commit for a page.
 size_t backingUnit()
 {
-    const size_t page_size = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
-    size_t unit = page_size;
+    size_t unit = static_cast<size_t>(getPageSize());
 
     static const std::string thp_dir = "/sys/kernel/mm/transparent_hugepage";
 
-    std::string top_mode;
-    const bool top_always = readSysfsLine(thp_dir + "/shmem_enabled", top_mode) && isAlwaysOrForce(top_mode);
+    const auto top_mode = readSysfsLine(thp_dir + "/shmem_enabled");
+    const bool top_always = top_mode && isAlwaysOrForce(*top_mode);
 
     /// Before the per-size knobs, the PMD size is the one large folio there is.
-    std::string pmd_size;
-    if (top_always && readSysfsLine(thp_dir + "/hpage_pmd_size", pmd_size))
-        unit = std::max(unit, static_cast<size_t>(std::strtoull(pmd_size.c_str(), nullptr, 10)));
+    if (top_always)
+    {
+        if (const auto pmd_size = readSysfsLine(thp_dir + "/hpage_pmd_size"))
+            unit = std::max(unit, parse<size_t>(*pmd_size));
+    }
 
     std::error_code error;
     for (auto it = std::filesystem::directory_iterator(thp_dir, error); !error && it != std::filesystem::directory_iterator();
@@ -539,14 +552,14 @@ size_t backingUnit()
         if (!name.starts_with("hugepages-") || !name.ends_with("kB"))
             continue;
 
-        std::string mode;
-        if (!readSysfsLine(it->path().string() + "/shmem_enabled", mode))
+        const auto mode = readSysfsLine(it->path().string() + "/shmem_enabled");
+        if (!mode)
             continue;
-        if (!mode.contains("[always]") && !(mode.contains("[inherit]") && top_always))
+        if (!mode->contains("[always]") && !(mode->contains("[inherit]") && top_always))
             continue;
 
-        const size_t size_kb = std::strtoull(name.c_str() + std::strlen("hugepages-"), nullptr, 10);
-        unit = std::max(unit, size_kb * 1024);
+        const std::string_view size_kb(name.begin() + std::strlen("hugepages-"), name.end() - std::strlen("kB"));
+        unit = std::max(unit, parse<size_t>(size_kb.data(), size_kb.size()) * 1024);
     }
 
     return unit;
@@ -563,10 +576,6 @@ size_t SharedMemoryRegion::roundUpToPages(size_t size)
 
 SharedMemoryRegion::~SharedMemoryRegion()
 {
-    /// The destructor is implicitly noexcept and logs below, so block memory-limit exceptions: the
-    /// region is usually released while its borrow is still charged for it.
-    LockMemoryExceptionInThread block_exceptions(VariableContext::Global);
-
     if (region_fd != -1)
         releasePagesNoThrow(region_fd);
 
@@ -607,12 +616,6 @@ size_t SharedMemoryRegion::releasePagesUpToLength()
 void SharedMemoryRegion::recommitUpToLength()
 {
     checkSupported();
-}
-
-size_t SharedMemoryRegion::refreshBackingSize()
-{
-    checkSupported();
-    return 0;
 }
 
 size_t SharedMemoryRegion::refreshFootprint()

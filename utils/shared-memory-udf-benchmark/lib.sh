@@ -112,8 +112,8 @@ bench_time() {
     printf '%s\n' "$elapsed"
 }
 
-# Prints "readMB writeMB": the bytes the server's threads moved through read()/write() during the
-# query, from the OSReadChars/OSWriteChars profile events. Counted, not just summed: with no
+# Prints "readMB writeMB": the bytes the server's threads moved through `read`/`write` during the
+# query, from the `OSReadChars`/`OSWriteChars` profile events. Counted, not just summed: with no
 # matching lines awk would print 0.00 0.00, and a renamed event would look like the perfect
 # shared-memory result.
 bench_syscall_io() {

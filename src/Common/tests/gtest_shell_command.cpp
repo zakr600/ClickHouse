@@ -334,7 +334,7 @@ TEST(ShellCommand, KeepsAPipeWhoseEndHasTheNumberOfAnEarlierTarget)
 /// A number the child would have two things installed under - a pipe and an inherited descriptor,
 /// or one descriptor twice - is refused before the child exists: the later `dup2` would silently
 /// replace the earlier, and the parent would go on reading a pipe nobody writes into. So is a
-/// standard stream: the child's 0, 1 and 2 are the pipes the parent talks to it through.
+/// standard stream the child is given a pipe for: those are the pipes the parent talks to it through.
 TEST(ShellCommand, RefusesADescriptorNumberClaimedTwice)
 {
     const int source = makeInheritableSource("twice");
@@ -355,12 +355,28 @@ TEST(ShellCommand, RefusesADescriptorNumberClaimedTwice)
     both_pipes.write_fds = {target};
     EXPECT_THROW(ShellCommand::execute(both_pipes), DB::Exception);
 
-    /// And the standard streams are nobody's to claim, whichever list does it.
+    /// And a standard stream the child gets a pipe for is nobody else's to claim.
     ShellCommand::Config pipe_on_stdout("cat");
     pipe_on_stdout.read_fds = {STDOUT_FILENO};
     EXPECT_THROW(ShellCommand::execute(pipe_on_stdout), DB::Exception);
 
     ::close(source);
+}
+
+/// One the child does not get a pipe for is free: with `pipe_stdin_only` its 1 and 2 are left alone,
+/// and a caller may read the child's stdout through `read_fds` instead.
+TEST(ShellCommand, AStandardStreamWithoutAPipeCanBeClaimed)
+{
+    ShellCommand::Config stdin_only("echo free");
+    stdin_only.pipe_stdin_only = true;
+    stdin_only.read_fds = {STDOUT_FILENO};
+    auto command = ShellCommand::execute(stdin_only);
+
+    String output;
+    readStringUntilEOF(output, command->read_fds.at(STDOUT_FILENO));
+    command->in.close();
+    command->wait();
+    EXPECT_EQ(output, "free\n");
 }
 
 namespace

@@ -293,18 +293,11 @@ ExternalLoader::LoadableMutablePtr ExternalUserDefinedExecutableFunctionsLoader:
         /// that line did not intend. Reject on the key being present rather than on its value -
         /// `<shared_memory_size>0</shared_memory_size>` says just as clearly that its
         /// author believed this function used shared memory, and it is just as wrong.
-        for (const auto & shared_memory_key : SHARED_MEMORY_CONFIGURATION_KEYS)
-        {
-            /// `use_shared_memory` itself is what is off here, and it may legitimately be spelled
-            /// out as `0`.
-            if (shared_memory_key == "use_shared_memory")
-                continue;
-
-            if (config.has(key_in_config + "." + std::string(shared_memory_key)))
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Executable user defined function {}: `{}` requires `use_shared_memory` to be enabled",
-                    name, shared_memory_key);
-        }
+        /// `use_shared_memory` itself is what is off here, and it may legitimately be spelled out as `0`.
+        if (const auto shared_memory_key = findSharedMemoryConfigurationKey(config, key_in_config, /*except_the_switch=*/ true))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Executable user defined function {}: `{}` requires `use_shared_memory` to be enabled",
+                name, *shared_memory_key);
     }
 
     size_t command_termination_timeout_seconds = config.getUInt64(key_in_config + ".command_termination_timeout", 10);

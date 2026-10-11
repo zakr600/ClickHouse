@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <exception>
 #include <csignal>
 #include <limits>
 
@@ -29,6 +30,7 @@
 #include <Common/Exception.h>
 #include <Common/ErrnoException.h>
 #include <Common/ShellCommand.h>
+#include <Common/ShellCommandsHolder.h>
 #include <Common/UDFProcessRegistry.h>
 #include <Common/PipeFDs.h>
 #include <IO/WriteHelpers.h>
@@ -128,19 +130,17 @@ LoggerPtr ShellCommand::getLogger()
 
 UInt64 ShellCommand::remainingTerminationTimeoutMs()
 {
-    const UInt64 now_ns = clock_gettime_ns();
-
     /// Arm the shared deadline once, on the first waiter (cleanup, or the destructor when
     /// cleanup never ran). Every later waiter subtracts the time already spent so both the
     /// cleanup poll and the destructor wait draw from one `command_termination_timeout`.
     if (termination_deadline_ns == 0)
-        termination_deadline_ns
-            = now_ns + config.terminate_in_destructor_strategy.wait_for_normal_exit_before_termination_seconds * 1000000000ULL;
+    {
+        const UInt64 timeout_seconds = config.terminate_in_destructor_strategy.wait_for_normal_exit_before_termination_seconds;
+        const UInt64 max_seconds = std::numeric_limits<UInt64>::max() / 1000;
+        termination_deadline_ns = monotonicDeadlineNs((timeout_seconds < max_seconds ? timeout_seconds : max_seconds) * 1000);
+    }
 
-    if (now_ns >= termination_deadline_ns)
-        return 0;
-
-    return (termination_deadline_ns - now_ns) / 1000000ULL;
+    return millisecondsUntil(termination_deadline_ns);
 }
 
 void ShellCommand::endTerminationGracePeriod() noexcept
@@ -151,7 +151,7 @@ void ShellCommand::endTerminationGracePeriod() noexcept
 void ShellCommand::discardWithoutGrace() noexcept
 {
     endTerminationGracePeriod();
-    reapOnDestruction();
+    reap_on_destruction = true;
 }
 
 ShellCommand::~ShellCommand()
@@ -197,7 +197,26 @@ ShellCommand::~ShellCommand()
 
         int retcode = kill(pid, config.terminate_in_destructor_strategy.termination_signal);
         if (retcode != 0)
+        {
             LOG_WARNING(getLogger(), "Cannot kill shell command pid {}, error: '{}'", pid, errnoToString());
+            return;
+        }
+
+        /// Reaped once it goes on the signal, as a command normally does - left alone, it would stay
+        /// a zombie for as long as the server runs - but not waited for here: a command can take its
+        /// time over the signal, and whatever destroys this (a query, a reload of a whole pool) is
+        /// not to be held up by it. A command that ignores the signal is left running, as it always
+        /// was.
+        try
+        {
+            const pid_t signalled_pid = pid;
+            forgetChild();
+            ShellCommandsHolder::instance().addSignalledChild(signalled_pid);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger());
+        }
     }
     else
     {
@@ -219,24 +238,31 @@ bool ShellCommand::tryWaitProcessWithTimeout(size_t timeout_in_milliseconds)
     wait_called = true;
 
     /// Before the wait: a child blocked writing into a pipe nobody drains any more gets `EPIPE`
-    /// rather than the whole timeout.
-    closeStreams();
+    /// rather than the whole timeout. Without throwing: this is the destructor's path.
+    closeStreamsNoThrow();
 
-    if (config.own_process_group)
+    /// The exited child of a group stays a zombie until its group has been killed, which keeps the
+    /// number of the group from being reused in between.
+    switch (waitForPidMilliseconds(pid, timeout_in_milliseconds, /*leave_unreaped=*/ config.own_process_group))
     {
-        /// The exited child stays a zombie until its group has been killed, which keeps the
-        /// number of the group from being reused in between.
-        if (waitForPidMilliseconds(pid, timeout_in_milliseconds, /*leave_unreaped=*/ true) != WaitForPidResult::EXITED)
+        case WaitForPidResult::EXITED:
+            if (config.own_process_group)
+            {
+                killAndReapNoThrow(/*whole_group=*/ true);
+                return child_reaped;
+            }
+            forgetChild();
+            return true;
+        case WaitForPidResult::NOT_OUR_CHILD:
+            /// Reaped by somebody else: its pid may belong to anybody now, so it is neither waited
+            /// for nor signalled - not by the destructor either, which takes this for an exit.
+            forgetChild();
+            return true;
+        case WaitForPidResult::TIMEOUT:
+        case WaitForPidResult::ERROR:
+            /// Still ours, as far as anyone can tell: signalled by the caller.
             return false;
-        killAndReapNoThrow(/*whole_group=*/ true);
-        return child_reaped;
     }
-
-    bool process_terminated_normally = waitForPidMilliseconds(pid, timeout_in_milliseconds) == WaitForPidResult::EXITED;
-    if (process_terminated_normally)
-        forgetChild();
-
-    return process_terminated_normally;
 }
 
 void ShellCommand::forgetChild()
@@ -256,8 +282,12 @@ void ShellCommand::killGroupOfExitedChild()
 
 void ShellCommand::killAndReapNoThrow(bool whole_group) noexcept
 {
-    if (child_reaped)
+    /// Once: a second call - the destructor's `SCOPE_EXIT` after `tryWaitProcessWithTimeout` has
+    /// already been here - would only wait out the same bound again for a child that `SIGKILL`
+    /// did not finish off within it.
+    if (child_reaped || kill_and_reap_done)
         return;
+    kill_and_reap_done = true;
 
     try
     {
@@ -287,16 +317,14 @@ void ShellCommand::killAndReapNoThrow(bool whole_group) noexcept
         switch (waitForPidMilliseconds(pid, reap_after_kill_timeout_ms))
         {
             case WaitForPidResult::EXITED:
+            case WaitForPidResult::NOT_OUR_CHILD:
                 forgetChild();
                 break;
             case WaitForPidResult::ERROR:
             {
-                /// The wait failed, which by itself says nothing about the child: it may have been
-                /// reaped by somebody else in between, or the wait may have run out of descriptors
-                /// (`pidfd_open`) with the child still ours. Only the first is forgotten.
+                /// The wait failed with the child still ours, as far as anyone can tell (run out of
+                /// descriptors for `pidfd_open`, say): it is not forgotten.
                 const int saved_errno = errno;
-                if (peekChildState(pid, /*blocking=*/ false) == ChildState::NOT_OUR_CHILD)
-                    forgetChild();
                 LOG_WARNING(getLogger(), "Cannot reap shell command pid {} after SIGKILL: {}", pid, errnoToString(saved_errno));
                 break;
             }
@@ -422,17 +450,19 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
     child_targets.reserve(handovers.size());
     for (const auto & handover : handovers)
     {
-        if (handover.step != ChildSetupStep::DUP_STDIN && handover.step != ChildSetupStep::DUP_STDOUT
-            && handover.step != ChildSetupStep::DUP_STDERR && handover.child_fd <= STDERR_FILENO)
+        /// A standard stream the child is given a pipe for is a target like any other, and a clash
+        /// with it is caught as a duplicate below; one it is not given a pipe for (`pipe_stdin_only`
+        /// leaves 1 and 2 alone) is free to be claimed.
+        if (handover.child_fd < 0)
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "Cannot install descriptor {} in a child as {}: 0, 1 and 2 are the child's standard streams",
-                handover.parent_fd, handover.child_fd);
+                "Cannot install descriptor {} in a child as {}", handover.parent_fd, handover.child_fd);
         child_targets.push_back(handover.child_fd);
     }
     std::sort(child_targets.begin(), child_targets.end());
     if (auto duplicate = std::adjacent_find(child_targets.begin(), child_targets.end()); duplicate != child_targets.end())
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "Descriptor {} is claimed more than once in the child (by read_fds, write_fds or inherited_fds)", *duplicate);
+            "Descriptor {} is claimed more than once in the child (by a standard stream, read_fds, write_fds or "
+            "inherited_fds)", *duplicate);
 
     /// The first number above every descriptor the child is going to install something under.
     if (child_targets.back() == std::numeric_limits<int>::max())
@@ -466,8 +496,7 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
     /// Another concurrent spawn can inherit a writer before Darwin installs `FD_CLOEXEC`.
     /// After `vfork` the report is already available or the child has executed successfully;
     /// receiving it must not depend on every unrelated copy of the writer being closed.
-    if (::fcntl(pipe_child_error.fds_rw[0], F_SETFL, O_NONBLOCK) == -1)
-        throw ErrnoException(ErrorCodes::CANNOT_FCNTL, "Cannot make the child error pipe non-blocking");
+    pipe_child_error.setNonBlockingRead();
     const int child_error_fd = ::fcntl(pipe_child_error.fds_rw[1], F_DUPFD_CLOEXEC, first_free_fd);
     if (child_error_fd == -1)
         throw ErrnoException(ErrorCodes::CANNOT_FCNTL, "Cannot duplicate the child error pipe");
@@ -560,6 +589,14 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
         /// NOLINTEND(clang-analyzer-unix.Vfork)
     }
 
+    /// The group, from this side too. A real `vfork` returns here only after the child's own
+    /// `setpgid`, but a `vfork` that is a `fork` in disguise (ThreadSanitizer intercepts it) can
+    /// return first, and a discard right after would then signal a group that does not exist yet.
+    /// Whichever of the two calls comes second finds the work done: here `EACCES` (the child has
+    /// `exec`ed already) or `ESRCH` (it has exited) mean exactly that, and are fine.
+    if (config.own_process_group && 0 != ::setpgid(pid, pid) && errno != EACCES && errno != ESRCH)
+        LOG_WARNING(getLogger(), "Cannot put shell command pid {} into a process group of its own: {}", pid, errnoToString());
+
     /// The child has either `exec`ed or written its report and exited (that is what `vfork`
     /// guarantees by the time it returns in the parent). Read the report without waiting for EOF:
     /// another process may still hold a copy of the write end.
@@ -583,14 +620,14 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
         /// is read as in any other build, without waiting.
         {
             static constexpr UInt64 child_report_wait_ms = 10000;
-            const UInt64 deadline_ns = clock_gettime_ns() + child_report_wait_ms * 1000000ULL;
+            const UInt64 deadline_ns = monotonicDeadlineNs(child_report_wait_ms);
             pollfd pfd{};
             pfd.fd = pipe_child_error.fds_rw[0];
             pfd.events = POLLIN;
             while (true)
             {
-                const UInt64 now_ns = clock_gettime_ns();
-                const int res = now_ns >= deadline_ns ? 0 : ::poll(&pfd, 1, static_cast<int>((deadline_ns - now_ns) / 1000000ULL + 1));
+                const UInt64 remaining_ms = millisecondsUntil(deadline_ns);
+                const int res = remaining_ms == 0 ? 0 : ::poll(&pfd, 1, static_cast<int>(remaining_ms));
                 if (res < 0 && errno == EINTR)
                     continue;
                 if (res == 0)
@@ -800,6 +837,9 @@ ShellCommand::tryWaitResult ShellCommand::tryWaitImpl(bool blocking, bool check_
             errno = saved_errno;
             throw ErrnoException(ErrorCodes::CANNOT_WAITPID, "Cannot waitid");
         }
+        /// The wait failed, but the child is still ours as far as anyone can tell: not forgotten.
+        if (state == ChildState::UNKNOWN)
+            throw ErrnoException(ErrorCodes::CANNOT_WAITPID, "Cannot waitid");
         killGroupOfExitedChild();
     }
 
@@ -914,6 +954,67 @@ bool ShellCommand::waitIfProccesTerminated()
 }
 
 
+/// Closes one input of the command. One whose close fails - flushing what is still buffered, when its
+/// reader is gone - is closed without it; the failure is kept in `first_failure` unless one is there
+/// already, and a failure of that second close is only logged.
+static void closeInput(WriteBufferFromFile & input, std::exception_ptr & first_failure, const LoggerPtr & log) noexcept
+{
+    try
+    {
+        input.close();
+    }
+    catch (...)
+    {
+        if (!first_failure)
+            first_failure = std::current_exception();
+        try
+        {
+            input.cancel();
+            input.close();
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log);
+        }
+    }
+}
+
+void ShellCommand::closeStreamsNoThrow() noexcept
+{
+    /// Each on its own, so that one that fails does not leave the others open.
+    std::exception_ptr input_failure;
+    closeInput(in, input_failure, getLogger());
+    for (auto & [_, fd] : write_fds)
+        closeInput(fd, input_failure, getLogger());
+    if (input_failure)
+    {
+        try
+        {
+            std::rethrow_exception(input_failure);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger());
+        }
+    }
+
+    auto close_no_throw = [](auto & stream)
+    {
+        try
+        {
+            stream.close();
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger());
+        }
+    };
+    close_no_throw(out);
+    close_no_throw(err);
+    for (auto & [_, fd] : read_fds)
+        close_no_throw(fd);
+}
+
 void ShellCommand::closeStreams()
 {
     in.close();
@@ -954,7 +1055,7 @@ bool ShellCommand::tryWaitWithoutStatusCheck()
 }
 
 
-void ShellCommand::readBufferedOutput(int (&drain_fds)[2], const StderrSink & stderr_sink) const
+void ShellCommand::readBufferedOutput(int (&drain_fds)[2], const StderrSink & stderr_sink, size_t * stdout_bytes_drained) const
 {
     char buffer[4096];
     for (size_t i = 0; i < 2; ++i)
@@ -974,64 +1075,70 @@ void ShellCommand::readBufferedOutput(int (&drain_fds)[2], const StderrSink & st
                 "Cannot query the pipe of shell command pid {} for buffered bytes", pid);
         }
 
-        while (available > 0)
+        /// Nothing read (`EAGAIN` on a descriptor `FIONREAD` just said holds bytes - the count went
+        /// stale - or EOF): the rest is left to the drain that follows, which polls, rather than
+        /// retried here on the strength of a count that is wrong.
+        while (available > 0 && drain_fds[i] >= 0)
         {
-            const ssize_t res = ::read(drain_fds[i], buffer, std::min(sizeof(buffer), static_cast<size_t>(available)));
-            if (res > 0)
-            {
-                if (i == 1 && stderr_sink)
-                    stderr_sink(std::string_view(buffer, static_cast<size_t>(res)));
-                available -= static_cast<int>(res);
-                continue;
-            }
-            if (res < 0 && errno == EINTR)
-                continue;
-
-            /// `EAGAIN` on a descriptor that `FIONREAD` just said holds bytes: the count and the
-            /// pipe disagree (another reader took them, or the count went stale). Nothing more is
-            /// coming out of this read, so the descriptor is left for the drain that follows -
-            /// which polls - rather than retried here on the strength of a count that is wrong.
-            if (res < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            const size_t bytes = readPipeOnce(
+                drain_fds, i, buffer, std::min(sizeof(buffer), static_cast<size_t>(available)), stderr_sink, stdout_bytes_drained);
+            if (bytes == 0)
                 break;
-
-            if (res < 0)
-                LOG_WARNING(getLogger(), "Cannot read a pipe of shell command pid {}, error: '{}'", pid, errnoToString());
-            drain_fds[i] = -1;
-            break;
+            available -= static_cast<int>(bytes);
         }
     }
 }
 
+size_t ShellCommand::readPipeOnce(
+    int (&drain_fds)[2], size_t i, char * buffer, size_t size, const StderrSink & stderr_sink, size_t * stdout_bytes_drained) const
+{
+    ssize_t res = 0;
+    do
+        res = ::read(drain_fds[i], buffer, size);
+    while (res < 0 && errno == EINTR);
+
+    if (res > 0)
+    {
+        /// `drain_fds[1]` is `stderr`, and it is the only one a caller can ask for: the child's
+        /// `stdout` past this point is output the protocol did not ask for, and reading it is the
+        /// whole reason it is read.
+        if (i == 1 && stderr_sink)
+            stderr_sink(std::string_view(buffer, static_cast<size_t>(res)));
+        if (i == 0 && stdout_bytes_drained)
+            *stdout_bytes_drained += static_cast<size_t>(res);
+        return static_cast<size_t>(res);
+    }
+
+    /// Nothing there right now: the descriptor stays, for the next readiness report.
+    if (res < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return 0;
+
+    if (res < 0)
+        LOG_WARNING(getLogger(), "Cannot read a pipe of shell command pid {}, error: '{}'", pid, errnoToString());
+
+    /// `res == 0` is EOF, and an error that is not a retryable one will not go away either: this
+    /// descriptor has nothing more to give.
+    drain_fds[i] = -1;
+    return 0;
+}
+
 void ShellCommand::drainOutputPipes(
-    int (&drain_fds)[2],
-    const StderrSink & stderr_sink,
-    UInt64 budget_ms,
-    bool budget_is_quiet_time,
-    UInt64 max_total_ms,
-    size_t * stdout_bytes_drained,
-    const std::function<void()> & check_cancelled,
-    int exit_fd) const
+    int (&drain_fds)[2], const StderrSink & stderr_sink, UInt64 budget_ms, size_t * stdout_bytes_drained, int exit_fd) const
 {
     static constexpr UInt64 poll_step_ms = 5;
     char discard_buffer[4096];
 
-    const UInt64 start_ns = clock_gettime_ns();
-    UInt64 deadline_ns = start_ns + budget_ms * 1000000ULL;
-    const UInt64 hard_deadline_ns = max_total_ms ? start_ns + max_total_ms * 1000000ULL : std::numeric_limits<UInt64>::max();
+    const UInt64 deadline_ns = monotonicDeadlineNs(budget_ms);
 
     while (drain_fds[0] >= 0 || drain_fds[1] >= 0)
     {
-        if (check_cancelled)
-            check_cancelled();
-
-        const UInt64 now_ns = clock_gettime_ns();
-        if (now_ns >= deadline_ns || now_ns >= hard_deadline_ns)
+        const UInt64 remaining_ms = millisecondsUntil(deadline_ns);
+        if (remaining_ms == 0)
             return;
 
         /// With the child's `pidfd` in the set the poll wakes up for its exit as well, so it can
         /// wait out the whole budget at once; without it, it comes back in short steps to let the
         /// caller look for the exit.
-        const UInt64 remaining_ms = (std::min(deadline_ns, hard_deadline_ns) - now_ns) / 1000000ULL + 1;
         const UInt64 step_ms = exit_fd >= 0 ? remaining_ms : std::min<UInt64>(poll_step_ms, remaining_ms);
 
         pollfd pfds[3]{};
@@ -1062,46 +1169,12 @@ void ShellCommand::drainOutputPipes(
             if (drain_fds[i] < 0)
                 continue;
 
+            /// One read per readiness report: `poll` promises only that a single read will not
+            /// block, and these descriptors are not necessarily non-blocking.
             if ((pfds[i].revents & POLLIN) != 0)
-            {
-                /// One read per readiness report: `poll` promises only that a single read will not
-                /// block, and these descriptors are not necessarily non-blocking.
-                const ssize_t res = ::read(drain_fds[i], discard_buffer, sizeof(discard_buffer));
-                if (res > 0)
-                {
-                    /// `drain_fds[1]` is `stderr`, and it is the only one a caller can ask for: the
-                    /// child's `stdout` past this point is output the protocol did not ask for, and
-                    /// reading it is the whole reason this loop exists.
-                    if (i == 1 && stderr_sink)
-                        stderr_sink(std::string_view(discard_buffer, static_cast<size_t>(res)));
-                    if (i == 0 && stdout_bytes_drained)
-                        *stdout_bytes_drained += static_cast<size_t>(res);
-
-                    /// Bytes arrived, so the quiet time starts over: a full pipe is read whole
-                    /// however long the reads take to get scheduled, and the budget is only ever
-                    /// spent waiting for bytes that do not come.
-                    if (budget_is_quiet_time)
-                        deadline_ns = clock_gettime_ns() + budget_ms * 1000000ULL;
-                    continue;
-                }
-
-                if (res < 0)
-                {
-                    if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
-                        continue;
-
-                    LOG_WARNING(
-                        getLogger(), "Cannot drain a pipe of shell command pid {}, error: '{}'", pid, errnoToString());
-                }
-
-                /// `res == 0` is EOF, and an error that is not one of the retryable ones will not
-                /// go away either: this descriptor has nothing more to give.
-                drain_fds[i] = -1;
-            }
+                readPipeOnce(drain_fds, i, discard_buffer, sizeof(discard_buffer), stderr_sink, stdout_bytes_drained);
             else if ((pfds[i].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0)
-            {
                 drain_fds[i] = -1;
-            }
         }
 
         /// The child has exited: back to the caller, which reaps it. What it wrote is still read
@@ -1186,6 +1259,7 @@ bool ShellCommand::waitDrainingOutput(const WaitDrainingOptions & options)
             return;
         }
 
+        /// `NOT_OUR_CHILD` is left to the reap at the top of the loop, which forgets the child.
         if (waitForPidMilliseconds(pid, timeout_ms, /*leave_unreaped=*/ true) == WaitForPidResult::ERROR)
             throw Exception(ErrorCodes::CANNOT_WAITPID, "Cannot wait for shell command pid {}", pid);
     };
@@ -1214,9 +1288,14 @@ bool ShellCommand::waitDrainingOutput(const WaitDrainingOptions & options)
             && (stdout_bytes_drained > stray_stdout_limit || (limit_stdout_drain && remainingTerminationTimeoutMs() == 0));
         if (stdout_abandoned_for_good && drain_fds[0] >= 0)
         {
-            out.close();
+            /// A stdout the command has already closed itself is its own EOF, not ours: dropped
+            /// from the set, and the exit grace below still applies to it.
+            if (!pipeHasEnded(drain_fds[0]))
+            {
+                out.close();
+                stdout_closed_here = true;
+            }
             drain_fds[0] = -1;
-            stdout_closed_here = true;
         }
 
         /// Reaped WITHOUT closing the pipes. Reaping is what makes the rest of what the child wrote
@@ -1234,33 +1313,14 @@ bool ShellCommand::waitDrainingOutput(const WaitDrainingOptions & options)
         if (proc_status.is_process_terminated)
         {
             /// What the pipes hold at this moment is the command's last words, and it is read
-            /// whole, first, with no deadline of any kind: the bytes are counted (`FIONREAD`) and
-            /// read exactly - a pipe of a megabyte, a sink that takes its time, a thread that is
-            /// not scheduled for a while, none of that may cost a command its `boom` under
-            /// `stderr_reaction` `throw`. Only what may arrive after that is on a budget - a
-            /// grandchild that inherited the write end: a quiet-time budget for the end that never
-            /// comes, and a hard cap for a grandchild that keeps the pipe fed, because what it
-            /// writes ten seconds after the command exited is not the command's. The budget is the
-            /// wait's own rather than what is left of `command_termination_timeout`: that one is
-            /// about how long the command may take to exit, and it has exited.
+            /// whole, with no deadline of any kind: the bytes are counted (`FIONREAD`) and read
+            /// exactly - a pipe of a megabyte, a sink that takes its time, a thread that is not
+            /// scheduled for a while, none of that may cost a command its `boom` under
+            /// `stderr_reaction` `throw`. Nothing after that is the command's: it has exited, so
+            /// everything it wrote is in the pipes already, and what may still arrive is written by
+            /// a descendant that outlived it and inherited the write end. That is not waited for:
+            /// the pipes are closed, and such a descendant gets `EPIPE` on its next write.
             readBufferedOutput(drain_fds, stderr_sink);
-            static constexpr UInt64 post_reap_quiet_ms = 100;
-            static constexpr UInt64 post_reap_max_total_ms = 10000;
-            /// A killed query does not sit this out: the child is reaped, and what is left is only
-            /// what a grandchild may still write. Its exit status and last words go unreported
-            /// then - the query is not waiting for a verdict any more - but the pipes are closed
-            /// all the same, rather than left open until the destructor.
-            try
-            {
-                drainOutputPipes(
-                    drain_fds, stderr_sink, post_reap_quiet_ms, /*budget_is_quiet_time=*/ true, post_reap_max_total_ms,
-                    /*stdout_bytes_drained=*/ nullptr, check_cancelled);
-            }
-            catch (...)
-            {
-                closeStreams();
-                throw;
-            }
             closeStreams();
 
             if (check_exit_status)
@@ -1284,7 +1344,7 @@ bool ShellCommand::waitDrainingOutput(const WaitDrainingOptions & options)
             /// reads), and under `stderr_reaction` `throw` is the verdict this wait exists to
             /// deliver. A grace period of zero in particular must not turn into "the last words
             /// are dropped".
-            readBufferedOutput(drain_fds, stderr_sink);
+            readBufferedOutput(drain_fds, stderr_sink, &stdout_bytes_drained);
 
             /// A child whose output has ended - both pipes at EOF, by its own doing - has made its last
             /// write and is, as a rule, on its way out: `exit` closes its descriptors before the
@@ -1297,12 +1357,11 @@ bool ShellCommand::waitDrainingOutput(const WaitDrainingOptions & options)
             {
                 static constexpr UInt64 exit_grace_ms = 1000;
                 static constexpr UInt64 exit_grace_step_ms = 100;
-                const UInt64 now_ns = clock_gettime_ns();
                 if (exit_grace_deadline_ns == 0)
-                    exit_grace_deadline_ns = now_ns + exit_grace_ms * 1000000ULL;
-                if (now_ns < exit_grace_deadline_ns)
+                    exit_grace_deadline_ns = monotonicDeadlineNs(exit_grace_ms);
+                if (const UInt64 grace_left_ms = millisecondsUntil(exit_grace_deadline_ns))
                 {
-                    wait_for_exit(std::min<UInt64>(exit_grace_step_ms, (exit_grace_deadline_ns - now_ns) / 1000000ULL + 1));
+                    wait_for_exit(std::min(exit_grace_step_ms, grace_left_ms));
                     continue;
                 }
             }
@@ -1325,30 +1384,54 @@ bool ShellCommand::waitDrainingOutput(const WaitDrainingOptions & options)
             continue;
         }
 
-        drainOutputPipes(
-            drain_fds, stderr_sink, step_ms, /*budget_is_quiet_time=*/ false, /*max_total_ms=*/ 0, &stdout_bytes_drained,
-            /*check_cancelled=*/ {}, exit_fd);
+        drainOutputPipes(drain_fds, stderr_sink, step_ms, &stdout_bytes_drained, exit_fd);
     }
 }
 
+
+Int16 ShellCommand::pendingEvents(int fd) noexcept
+{
+    pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+
+    int res = 0;
+    do
+    {
+        pfd.revents = 0;
+        res = ::poll(&pfd, 1, 0);
+    }
+    while (res < 0 && errno == EINTR);
+
+    if (res < 0)
+    {
+        /// Answered as an error on the pipe, which every caller takes for a process not to be built
+        /// on - but said here for what it is, or the discard would be reported as one that exited.
+        const int saved_errno = errno;
+        try
+        {
+            LOG_WARNING(getLogger(), "Cannot poll the pipe {} of a command: {}", fd, errnoToString(saved_errno));
+        }
+        catch (...) // NOLINT(bugprone-empty-catch) Ok: a log line that cannot be written must not fail a noexcept probe
+        {
+        }
+        return POLLERR;
+    }
+    return static_cast<Int16>(pfd.revents);
+}
+
+bool ShellCommand::pipeHasEnded(int fd) noexcept
+{
+    const Int16 events = pendingEvents(fd);
+    return (events & POLLHUP) != 0 && (events & POLLIN) == 0;
+}
 
 bool ShellCommand::outputPipesHaveEnded(const int (&drain_fds)[2]) const
 {
     for (int fd : drain_fds)
     {
         /// Dropped from the set after its EOF (`drainOutputPipes`), or never there.
-        if (fd < 0)
-            continue;
-
-        pollfd pfd{};
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-        int res = 0;
-        do
-            res = ::poll(&pfd, 1, 0);
-        while (res < 0 && errno == EINTR);
-
-        if (res <= 0 || (pfd.revents & POLLIN) != 0 || (pfd.revents & POLLHUP) == 0)
+        if (fd >= 0 && !pipeHasEnded(fd))
             return false;
     }
     return true;
@@ -1356,10 +1439,15 @@ bool ShellCommand::outputPipesHaveEnded(const int (&drain_fds)[2]) const
 
 void ShellCommand::closeInputs()
 {
-    in.close();
-
-    for (auto & [descriptor, buffer] : write_fds)
-        buffer.close();
+    /// Every input is closed even if closing one fails: a command written to exit once all its
+    /// inputs are done would otherwise wait for the rest until the destructor closes them. The first
+    /// failure is reported after that.
+    std::exception_ptr first_failure;
+    closeInput(in, first_failure, getLogger());
+    for (auto & [_, buffer] : write_fds)
+        closeInput(buffer, first_failure, getLogger());
+    if (first_failure)
+        std::rethrow_exception(first_failure);
 }
 
 

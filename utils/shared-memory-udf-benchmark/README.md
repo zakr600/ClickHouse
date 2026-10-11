@@ -34,7 +34,7 @@ The runner starts a throw-away `clickhouse server` on a free local port with a g
   state. Medians rather than means because noise on a shared machine is one-sided (a run can only
   be slowed down), and a bootstrap interval rather than a t-interval for the same reason: nothing
   here is normal. A speedup whose interval contains `1.0` is parity, whatever the point estimate.
-* **bytes that crossed the kernel via `read()`/`write()` syscalls** (`OSReadChars` / `OSWriteChars` profile events) — a build-independent structural measure of transport cost. For the pipe transports this equals the payload volume; for the shared-memory transports it is only the tiny control messages, because both sides work through their mappings and no payload byte goes through `read`/`write` at all.
+* **bytes that crossed the kernel via `read`/`write` syscalls** (`OSReadChars` / `OSWriteChars` profile events) — a build-independent structural measure of transport cost. For the pipe transports this equals the payload volume; for the shared-memory transports it is only the tiny control messages, because both sides work through their mappings and no payload byte goes through `read`/`write` at all.
 
 ## Sweeps
 

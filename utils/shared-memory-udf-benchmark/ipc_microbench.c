@@ -6,11 +6,11 @@
 // Mechanisms compared:
 //   pipe        - bulk data goes through an anonymous pipe (two kernel copies per chunk);
 //   tmpfs-mmap  - bulk in an mmap'd file under /dev/shm; a 1-byte pipe carries the control signal;
-//   memfd-mmap  - same, but the shared memory is an anonymous memfd_create() region the child
+//   memfd-mmap  - same, but the shared memory is an anonymous `memfd_create` region the child
 //                 inherits (no filesystem path) - this is what the shared-memory UDF transport
 //                 does, because such a region can be sealed against shrinking;
-//   vmsplice    - the parent maps its buffer pages straight into a pipe with vmsplice(), saving the
-//                 copy a write() makes on the sending side, and the child read()s them out.
+//   vmsplice    - the parent maps its buffer pages straight into a pipe with `vmsplice`, saving the
+//                 copy a `write` makes on the sending side, and the child `read`s them out.
 //
 // The parent's buffer is deliberately NOT donated with SPLICE_F_GIFT: gifted pages may be stolen by
 // the kernel, so they could not be reused by the next iteration, and the receiving end can only

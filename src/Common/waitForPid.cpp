@@ -39,6 +39,9 @@ enum PollPidResult
     FAILED
 };
 
+/// The `pid_fd` of a wait whose first step has not opened one yet (see `pollPid`).
+constexpr int PID_FD_NOT_OPENED = -2;
+
 }
 
 #if defined(OS_LINUX)
@@ -146,34 +149,41 @@ static PollPidResult waitStepWithoutPidFd(int timeout_in_ms)
     return PollPidResult::RESTART;
 }
 
-static PollPidResult pollPid(pid_t pid, int timeout_in_ms)
+/// `pid_fd` is the state of one whole wait: `PID_FD_NOT_OPENED` until the first step opens it, then
+/// the `pidfd` - kept for every later step, so that a wait a signal keeps interrupting does not open
+/// and close one each time - or -1 when there is none to be had. The caller closes it.
+static PollPidResult pollPid(pid_t pid, int timeout_in_ms, int & pid_fd)
 {
-    if (!supportsPidFdOpen())
-        return waitStepWithoutPidFd(timeout_in_ms);
-
-    // pidfd_open cannot be interrupted, no EINTR handling
-    int pid_fd = openPidFdForWaiting(pid);
-
-    if (pid_fd < 0)
+    if (pid_fd == PID_FD_NOT_OPENED)
     {
-        if (errno == ESRCH)
-            return PollPidResult::RESTART;
+        if (!supportsPidFdOpen())
+        {
+            pid_fd = -1;
+        }
+        else
+        {
+            // pidfd_open cannot be interrupted, no EINTR handling
+            pid_fd = openPidFdForWaiting(pid);
+            if (pid_fd < 0)
+            {
+                /// Gone already: the caller's look at it will say how.
+                if (errno == ESRCH)
+                {
+                    pid_fd = PID_FD_NOT_OPENED;
+                    return PollPidResult::RESTART;
+                }
 
-        /// Refused rather than failed: a seccomp profile (older container runtimes deny
-        /// `pidfd_open`) or a kernel built without it. The process is there all the same, and
-        /// it is waited for as on a kernel that has no `pidfd` at all.
-        if (errno == EPERM || errno == EACCES || errno == ENOSYS)
-            return waitStepWithoutPidFd(timeout_in_ms);
-
-        return PollPidResult::FAILED;
+                /// Refused rather than failed: a seccomp profile (older container runtimes deny
+                /// `pidfd_open`) or a kernel built without it. The process is there all the same,
+                /// and it is waited for as on a kernel that has no `pidfd` at all.
+                if (errno != EPERM && errno != EACCES && errno != ENOSYS)
+                    return PollPidResult::FAILED;
+            }
+        }
     }
 
-    /// Releases pid_fd on every return path, including poll timeout and error.
-    SCOPE_EXIT(
-    {
-        [[maybe_unused]] int err = close(pid_fd);
-        chassert(!err || errno == EINTR);
-    });
+    if (pid_fd < 0)
+        return waitStepWithoutPidFd(timeout_in_ms);
 
     struct pollfd pollfd{};
     pollfd.fd = pid_fd;
@@ -204,7 +214,7 @@ static PollPidResult pollPid(pid_t pid, int timeout_in_ms)
 namespace DB
 {
 
-static PollPidResult pollPid(pid_t pid, int timeout_in_ms)
+static PollPidResult pollPid(pid_t pid, int timeout_in_ms, int & /*pid_fd*/)
 {
     int kq = kqueue();
     if (kq == -1)
@@ -255,7 +265,7 @@ namespace DB
 
 /// Grab the process, wait for it to change state, and check whether it's
 /// terminated.
-static PollPidResult pollPid(pid_t pid, int timeout_in_ms)
+static PollPidResult pollPid(pid_t pid, int timeout_in_ms, int & /*pid_fd*/)
 {
     PollPidResult result = PollPidResult::TIMED_OUT;
     int rc, perr;
@@ -288,7 +298,7 @@ namespace DB
 {
 
 /// WebAssembly has no child processes: there is no `fork` and no `exec`, so nothing to wait for.
-static PollPidResult pollPid(pid_t /*pid*/, int /*timeout_in_ms*/)
+static PollPidResult pollPid(pid_t /*pid*/, int /*timeout_in_ms*/, int & /*pid_fd*/)
 {
     return PollPidResult::FAILED;
 }
@@ -306,7 +316,7 @@ ChildState peekChildState(pid_t pid, bool blocking)
     siginfo_t info{};
     int res = HANDLE_EINTR(waitid(P_PID, static_cast<id_t>(pid), &info, WEXITED | WNOWAIT | (blocking ? 0 : WNOHANG)));
     if (res != 0)
-        return ChildState::NOT_OUR_CHILD;
+        return errno == ECHILD ? ChildState::NOT_OUR_CHILD : ChildState::UNKNOWN;
     /// With `WNOHANG` and a child that has not exited, `waitid` succeeds and leaves `info` zeroed.
     /// glibc defines `si_pid` as a macro that names itself, which `-Wdisabled-macro-expansion` reports.
 #pragma clang diagnostic push
@@ -318,23 +328,29 @@ ChildState peekChildState(pid_t pid, bool blocking)
 }
 
 /// 1 if `pid` has exited (and, unless `leave_unreaped`, is reaped), 0 if it is running, -1 on error.
-static int checkPidExited(pid_t pid, bool leave_unreaped)
+static ChildState checkPidExited(pid_t pid, bool leave_unreaped)
 {
     if (leave_unreaped)
-    {
-        switch (peekChildState(pid, /*blocking=*/ false))
-        {
-            case ChildState::EXITED: return 1;
-            case ChildState::RUNNING: return 0;
-            case ChildState::NOT_OUR_CHILD: return -1;
-        }
-    }
+        return peekChildState(pid, /*blocking=*/ false);
 
     int status = 0;
     int waitpid_res = HANDLE_EINTR(waitpid(pid, &status, WNOHANG));
     if (waitpid_res == pid)
-        return 1;
-    return waitpid_res == 0 ? 0 : -1;
+        return ChildState::EXITED;
+    if (waitpid_res == 0)
+        return ChildState::RUNNING;
+    return errno == ECHILD ? ChildState::NOT_OUR_CHILD : ChildState::UNKNOWN;
+}
+
+static WaitForPidResult toWaitResult(ChildState state)
+{
+    switch (state)
+    {
+        case ChildState::EXITED: return WaitForPidResult::EXITED;
+        case ChildState::RUNNING: return WaitForPidResult::TIMEOUT;
+        case ChildState::NOT_OUR_CHILD: return WaitForPidResult::NOT_OUR_CHILD;
+        case ChildState::UNKNOWN: return WaitForPidResult::ERROR;
+    }
 }
 
 WaitForPidResult waitForPidMilliseconds(pid_t pid, size_t timeout_in_milliseconds, bool leave_unreaped)
@@ -345,8 +361,7 @@ WaitForPidResult waitForPidMilliseconds(pid_t pid, size_t timeout_in_millisecond
     {
         /// If there is no timeout before signal try to waitpid 1 time without block so we can avoid sending
         /// signal if process is already normally terminated.
-        const int exited = checkPidExited(pid, leave_unreaped);
-        return exited == 1 ? WaitForPidResult::EXITED : (exited == 0 ? WaitForPidResult::TIMEOUT : WaitForPidResult::ERROR);
+        return toWaitResult(checkPidExited(pid, leave_unreaped));
     }
 
     /// If timeout is positive, poll until the process exits or the total wall
@@ -355,14 +370,20 @@ WaitForPidResult waitForPidMilliseconds(pid_t pid, size_t timeout_in_millisecond
     /// that a `pollPid` that returns early - a signal, or the short steps it
     /// takes without a `pidfd` - still subtracts real elapsed time.
 
+    int pid_fd = PID_FD_NOT_OPENED;
+    SCOPE_EXIT({
+        if (pid_fd >= 0)
+        {
+            [[maybe_unused]] int err = close(pid_fd);
+            chassert(!err || errno == EINTR);
+        }
+    });
+
     while (true)
     {
-        int exited = checkPidExited(pid, leave_unreaped);
-        if (exited == 1)
-            return WaitForPidResult::EXITED;
-
-        if (exited != 0)
-            return WaitForPidResult::ERROR;
+        const ChildState state = checkPidExited(pid, leave_unreaped);
+        if (state != ChildState::RUNNING)
+            return toWaitResult(state);
 
         const UInt64 elapsed_ms = watch.elapsedMilliseconds();
         if (elapsed_ms >= timeout_in_milliseconds)
@@ -372,7 +393,7 @@ WaitForPidResult waitForPidMilliseconds(pid_t pid, size_t timeout_in_millisecond
         /// that times out only sends the loop back to the deadline check above.
         const UInt64 remaining_ms = timeout_in_milliseconds - elapsed_ms;
         const int step_ms = static_cast<int>(std::min<UInt64>(remaining_ms, std::numeric_limits<int>::max()));
-        if (pollPid(pid, step_ms) == PollPidResult::FAILED)
+        if (pollPid(pid, step_ms, pid_fd) == PollPidResult::FAILED)
             return WaitForPidResult::ERROR;
     }
 }

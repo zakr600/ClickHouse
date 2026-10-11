@@ -5,23 +5,16 @@
 # overproduction that a row limit on the format cannot catch, and that the server has to catch on
 # the row count itself, before the chunk leaves the source and before the worker goes back to the
 # pool as if it had answered correctly.
+import os
 import struct
 import sys
 
-
-def read_varint(stream):
-    result = 0
-    shift = 0
-    while True:
-        byte = stream.read(1)
-        if not byte:
-            return None
-        result |= (byte[0] & 0x7F) << shift
-        if not (byte[0] & 0x80):
-            return result
-        shift += 7
+# CI runs Python with `PYTHONSAFEPATH`, which keeps the script's own directory out of `sys.path`.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from shm_protocol import read_varint  # noqa: E402
 
 
+# Unlike the shared one, appends to a `bytearray`: the answer block is built whole, then written.
 def write_varint(out, value):
     while True:
         byte = value & 0x7F
