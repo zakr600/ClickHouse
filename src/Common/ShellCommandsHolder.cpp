@@ -160,7 +160,10 @@ void ShellCommandsHolder::runReaper()
             }
             SCOPE_EXIT({
                 for (int pidfd : pidfds)
-                    ::close(pidfd);
+                {
+                    [[maybe_unused]] int err = ::close(pidfd);
+                    chassert(!err || errno == EINTR);
+                }
                 pidfds.clear();
             });
 
