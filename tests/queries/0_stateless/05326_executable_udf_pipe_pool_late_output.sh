@@ -31,17 +31,17 @@ function pipe_function()
 {
     pipe_function pipe_flood_none UInt64 TabSeparated \
         "<stderr_reaction>none</stderr_reaction><command_read_timeout>5000</command_read_timeout>" \
-        "pipe_pool_stderr_flood_after_gap.py --go $GO"
+        "pipe_pool_pid.py --go $GO --after-go stderr-flood"
     pipe_function pipe_flood_throw UInt64 TabSeparated \
         "<stderr_reaction>throw</stderr_reaction><command_read_timeout>5000</command_read_timeout>" \
-        "pipe_pool_stderr_flood_after_gap.py --go $GO --bytes 49152 --marker $MARKER"
-    pipe_function pipe_stderr_after_rows String TabSeparated "<stderr_reaction>throw</stderr_reaction>" pipe_pool_stderr_after_rows.py
-    pipe_function pipe_late_exit UInt64 TabSeparated "" "pipe_pool_late_exit.py --go $GO"
-    pipe_function pipe_stderr_then_late_exit UInt64 TabSeparated "" "pipe_pool_stderr_then_late_exit.py --go $GO"
+        "pipe_pool_pid.py --go $GO --after-go stderr-flood --bytes 49152 --marker $MARKER"
+    pipe_function pipe_stderr_after_rows String TabSeparated "<stderr_reaction>throw</stderr_reaction>" "pipe_udf.py --stderr-with-rows"
+    pipe_function pipe_late_exit UInt64 TabSeparated "" "pipe_pool_pid.py --go $GO --after-go exit"
+    pipe_function pipe_stderr_then_late_exit UInt64 TabSeparated "" "pipe_pool_pid.py --go $GO --after-go last-words"
     pipe_function pipe_native_overproduce String Native "" pipe_pool_native_overproduce.py
-    pipe_function pipe_late_stdout UInt64 TabSeparated "" "pipe_pool_late_stdout.py --go $GO --marker $MARKER"
-    pipe_function pipe_chatty UInt64 TabSeparated "" pipe_pool_chatty.py
-    pipe_function pipe_pid_then_stderr String TabSeparated "<stderr_reaction>log_last</stderr_reaction>" pipe_pool_pid_then_stderr.py
+    pipe_function pipe_late_stdout UInt64 TabSeparated "" "pipe_pool_pid.py --go $GO --after-go stdout-row --marker $MARKER"
+    pipe_function pipe_chatty UInt64 TabSeparated "" "pipe_pool_pid.py --extra-newline"
+    pipe_function pipe_pid_then_stderr String TabSeparated "<stderr_reaction>log_last</stderr_reaction>" "pipe_pool_pid.py --stderr-after-rows"
 } | shm_functions
 
 echo "--- under none, a worker flooding stderr once it is back in the pool is never left blocked"
@@ -87,7 +87,7 @@ echo "--- under throw, stderr written with the rows fails the query that caused 
 shm_local "
     SELECT pipe_stderr_after_rows(1);
 "
-shm_output_contains "complaining right after the rows"
+shm_output_contains "the command complains"
 
 echo "--- a worker that exited in the pool is replaced"
 # Nobody waits for a pooled process between borrows, so the next query is the first to find out -

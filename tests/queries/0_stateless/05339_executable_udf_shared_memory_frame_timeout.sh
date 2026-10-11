@@ -17,7 +17,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
     echo "<argument><type>UInt64</type></argument><format>TabSeparated</format>"
     echo "<use_shared_memory>1</use_shared_memory><shared_memory_size>4096</shared_memory_size>"
     echo "<command_read_timeout>1000</command_read_timeout><command_termination_timeout>0</command_termination_timeout>"
-    echo "<command>shm_udf_drip.py 0.2 40</command></function>"
+    echo "<command>shm_udf_broken.py --drip 0.2 40</command></function>"
 } | shm_functions
 
 echo "--- a frame that trickles in is timed out as a whole"

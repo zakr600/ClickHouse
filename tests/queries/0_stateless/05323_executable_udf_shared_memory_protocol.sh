@@ -14,40 +14,32 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=./shm_udf_scripts/common.sh
 . "$CUR_DIR"/shm_udf_scripts/common.sh
 
-function shm_function()
-{
-    # name, type, the options that make it what it is, the command, the arguments (one `UInt64` if
-    # not given), the format (`TabSeparated` if not given)
-    echo "<function><type>$2</type><name>$1</name><return_type>String</return_type>"
-    echo "${5-<argument><type>UInt64</type></argument>}<format>${6:-TabSeparated}</format>"
-    echo "<use_shared_memory>1</use_shared_memory>$3<command>$4</command></function>"
-}
-
 {
     shm_function shm executable "<shared_memory_size>1048576</shared_memory_size>" shm_udf.py
     shm_function shm_pool executable_pool "<shared_memory_size>1048576</shared_memory_size>" shm_udf.py
     shm_function shm_zero_arg executable "<shared_memory_size>1048576</shared_memory_size>" "shm_udf.py --zero-argument" ""
     shm_function shm_zero_arg_pool executable_pool \
         "<pool_size>1</pool_size><shared_memory_size>1048576</shared_memory_size>" "shm_udf.py --zero-argument" ""
-    # `shm_udf_grow.py` echoes its input back at offset 0; `shm_udf.py` writes its result after it.
-    shm_function shm_grow executable "<shared_memory_size>16</shared_memory_size><shared_memory_max_size>1048576</shared_memory_max_size>" shm_udf_grow.py
+    # `shm_udf.py --echo --answer-at-start` echoes its input back at offset 0; `shm_udf.py` writes its
+    # result after it.
+    shm_function shm_grow executable "<shared_memory_size>16</shared_memory_size><shared_memory_max_size>1048576</shared_memory_max_size>" "shm_udf.py --echo --answer-at-start"
     shm_function shm_grow_pool executable_pool \
-        "<shared_memory_size>16</shared_memory_size><shared_memory_max_size>1048576</shared_memory_max_size>" shm_udf_grow.py
+        "<shared_memory_size>16</shared_memory_size><shared_memory_max_size>1048576</shared_memory_max_size>" "shm_udf.py --echo --answer-at-start"
     shm_function shm_grow_after_input executable \
         "<shared_memory_size>16</shared_memory_size><shared_memory_max_size>1048576</shared_memory_max_size>" shm_udf.py
-    shm_function shm_exact executable "<shared_memory_size>6</shared_memory_size>" shm_udf_grow.py
+    shm_function shm_exact executable "<shared_memory_size>6</shared_memory_size>" "shm_udf.py --echo --answer-at-start"
     shm_function shm_binary_pool executable_pool "<pool_size>2</pool_size><shared_memory_size>1048576</shared_memory_size>" shm_udf_binary.py \
         "<argument><type>UInt64</type><name>id</name></argument><argument><type>Nullable(String)</type><name>label</name></argument>" RowBinary
 
-    shm_function shm_pool_short executable_pool "<shared_memory_size>1048576</shared_memory_size>" shm_udf_short.py
-    shm_function shm_pool_over executable_pool "<shared_memory_size>1048576</shared_memory_size>" shm_udf_over.py
+    shm_function shm_pool_short executable_pool "<shared_memory_size>1048576</shared_memory_size>" "shm_udf.py --echo --first-row-only"
+    shm_function shm_pool_over executable_pool "<shared_memory_size>1048576</shared_memory_size>" "shm_udf.py --echo --duplicate-rows"
     shm_function shm_small executable "<shared_memory_size>8</shared_memory_size>" shm_udf.py
     shm_function shm_tiny executable "<shared_memory_size>4</shared_memory_size>" shm_udf.py
-    shm_function shm_error executable "<shared_memory_size>1048576</shared_memory_size>" shm_udf_error.py
-    shm_function shm_pool_error executable_pool "<shared_memory_size>4096</shared_memory_size>" shm_udf_error.py
-    shm_function shm_bad_offset executable "<shared_memory_size>1048576</shared_memory_size>" shm_udf_bad_offset.py
-    shm_function shm_die executable "<shared_memory_size>1048576</shared_memory_size>" shm_udf_die.py
-    shm_function shm_pool_die executable_pool "<pool_size>2</pool_size><shared_memory_size>4096</shared_memory_size>" shm_udf_die.py
+    shm_function shm_error executable "<shared_memory_size>1048576</shared_memory_size>" "shm_udf_broken.py --error"
+    shm_function shm_pool_error executable_pool "<shared_memory_size>4096</shared_memory_size>" "shm_udf_broken.py --error"
+    shm_function shm_bad_offset executable "<shared_memory_size>1048576</shared_memory_size>" "shm_udf_broken.py --bad-offset"
+    shm_function shm_die executable "<shared_memory_size>1048576</shared_memory_size>" "shm_udf_broken.py --die"
+    shm_function shm_pool_die executable_pool "<pool_size>2</pool_size><shared_memory_size>4096</shared_memory_size>" "shm_udf_broken.py --die"
 } | shm_functions
 
 echo "--- requests and responses"

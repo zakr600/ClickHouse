@@ -9,7 +9,7 @@
 #
 # The pool lives as long as the process does, so every borrower has to come to the same one: each
 # scenario runs one `clickhouse-local` that listens on HTTP and sends itself the queries of the other
-# users. `http_make_head_request` is off, because a `HEAD` request runs the query too.
+# users (`shm_local_listening`).
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -17,37 +17,14 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=./shm_udf_scripts/common.sh
 . "$CUR_DIR"/shm_udf_scripts/common.sh
 
-function shm_function()
+POOL="<pool_size>1</pool_size><shared_memory_size>65536</shared_memory_size>"
 {
-    # name, the options that make it what it is, the command
-    echo "<function><type>executable_pool</type><name>$1</name><return_type>String</return_type>"
-    echo "<argument><type>UInt64</type></argument><format>TabSeparated</format><pool_size>1</pool_size>"
-    echo "<use_shared_memory>1</use_shared_memory><shared_memory_size>65536</shared_memory_size>$2<command>$3</command></function>"
-}
-
-{
-    shm_function shm_peek "" shm_udf_peek.py
-    shm_function shm_peek_extended "<shared_memory_max_size>262144</shared_memory_max_size>" \
-        "shm_udf_peek.py --extend-to 131072 --peek-at 65536"
+    shm_function shm_peek executable_pool "$POOL" "shm_udf_region.py --peek"
+    shm_function shm_peek_extended executable_pool "$POOL<shared_memory_max_size>262144</shared_memory_max_size>" \
+        "shm_udf_region.py --peek --extend-to 131072 --peek-at 65536"
 } | shm_functions
 
-# The query, run as the user.
-function as_user()
-{
-    echo "SELECT * FROM url('http://127.0.0.1:' || toString(getServerPort('http_port'))
-        || '/?user=$1&query=' || encodeURLComponent('$2'), TSV, 'result String') SETTINGS http_make_head_request = 0;"
-}
-
 SCRUBBED="SELECT sum(value) FROM system.events WHERE event = 'ExecutableUDFSharedMemoryScrubbedBytes';"
-
-function shm_local_listening()
-{
-    shm_local "
-        CREATE USER other IDENTIFIED WITH no_password;
-        GRANT SELECT ON *.* TO other;
-        SYSTEM START LISTEN HTTP;
-        $1" --listen_host 127.0.0.1 --http_port 0
-}
 
 echo "--- between users"
 # The first request finds a fresh region and dirties 4 KiB past its input. The same user again: the
@@ -58,7 +35,7 @@ shm_local_listening "
     SELECT shm_peek(1);
     SELECT shm_peek(1);
     $SCRUBBED
-    $(as_user other "SELECT shm_peek(1)")
+    $(shm_as_user other "SELECT shm_peek(1)")
     $SCRUBBED
     SELECT shm_peek(1);
 "
@@ -74,13 +51,13 @@ shm_local_listening "
     GRANT SELECT ON *.* TO role_a, role_b;
     GRANT role_a, role_b TO other;
     SET DEFAULT ROLE role_a TO other;
-    $(as_user other "SELECT shm_peek(1)")
-    $(as_user other "SELECT shm_peek(1)")
+    $(shm_as_user other "SELECT shm_peek(1)")
+    $(shm_as_user other "SELECT shm_peek(1)")
     $SCRUBBED
     SET DEFAULT ROLE role_b TO other;
-    $(as_user other "SELECT shm_peek(1)")
+    $(shm_as_user other "SELECT shm_peek(1)")
     $SCRUBBED
-    $(as_user other "SELECT shm_peek(1)")
+    $(shm_as_user other "SELECT shm_peek(1)")
     $SCRUBBED
 "
 
@@ -97,7 +74,7 @@ shm_local_listening "
     SELECT shm_peek_extended(1);
     SELECT shm_peek_extended(1);
     $SCRUBBED
-    $(as_user other "SELECT shm_peek_extended(1)")
+    $(shm_as_user other "SELECT shm_peek_extended(1)")
     $SCRUBBED
     SELECT shm_peek_extended(1);
 "

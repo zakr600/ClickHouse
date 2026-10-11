@@ -22,11 +22,11 @@ PID_FILE="$SHM_UDF_WORK/pid"
     echo "<function><type>executable_pool</type><name>pipe_late_stdout_lingers</name><return_type>UInt64</return_type>"
     echo "<argument><type>UInt64</type></argument><format>TabSeparated</format><pool_size>1</pool_size>"
     echo "<command_termination_timeout>86400</command_termination_timeout>"
-    echo "<command>pipe_pool_late_stdout.py --go $GO --marker $MARKER --linger</command></function>"
+    echo "<command>pipe_pool_pid.py --go $GO --after-go stdout-row --marker $MARKER --linger</command></function>"
     echo "<function><type>executable_pool</type><name>pipe_short_answer_lingers</name><return_type>String</return_type>"
     echo "<argument><type>UInt64</type></argument><format>TabSeparated</format><pool_size>1</pool_size>"
     echo "<command_termination_timeout>1</command_termination_timeout>"
-    echo "<command>pipe_pool_short_answer_lingers.py --pid-file $PID_FILE</command></function>"
+    echo "<command>pipe_udf.py --first-row-only --close-stdout --pid-file $PID_FILE --linger</command></function>"
 } | shm_functions
 
 shm_local "

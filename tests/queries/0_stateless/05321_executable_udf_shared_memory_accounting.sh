@@ -13,21 +13,13 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=./shm_udf_scripts/common.sh
 . "$CUR_DIR"/shm_udf_scripts/common.sh
 
-function shm_function()
-{
-    # name, type, the options that make it what it is, the command
-    echo "<function><type>$2</type><name>$1</name><return_type>String</return_type>"
-    echo "<argument><type>UInt64</type></argument><format>TabSeparated</format>"
-    echo "<use_shared_memory>1</use_shared_memory>$3<command>$4</command></function>"
-}
-
 {
     shm_function shm_pool executable_pool "<shared_memory_size>1048576</shared_memory_size>" shm_udf.py
     shm_function shm_pool_pid executable_pool "<shared_memory_size>786432</shared_memory_size>" "shm_udf.py --report-pid"
     shm_function shm_idle executable_pool "<pool_size>1</pool_size><shared_memory_size>67108864</shared_memory_size>" shm_udf.py
     shm_function shm_pool_grow executable_pool \
-        "<pool_size>1</pool_size><shared_memory_size>4096</shared_memory_size><shared_memory_max_size>1048576</shared_memory_max_size>" shm_udf_grow.py
-    shm_function shm_busy_chatty executable_pool "<pool_size>1</pool_size><shared_memory_size>4096</shared_memory_size>" shm_udf_busy_chatty.py
+        "<pool_size>1</pool_size><shared_memory_size>4096</shared_memory_size><shared_memory_max_size>1048576</shared_memory_max_size>" "shm_udf.py --echo --answer-at-start"
+    shm_function shm_busy_chatty executable_pool "<pool_size>1</pool_size><shared_memory_size>4096</shared_memory_size>" "shm_udf_noisy.py --report-pid --burn-cpu --stdout-after-frame byte"
 } | shm_functions
 
 echo "--- the region of a pooled worker is charged to the query that uses it"

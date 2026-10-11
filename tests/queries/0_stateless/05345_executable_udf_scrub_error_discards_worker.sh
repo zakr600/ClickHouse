@@ -17,17 +17,12 @@ cat <<'XML' | shm_functions
 <argument><type>UInt64</type></argument><format>TabSeparated</format><pool_size>1</pool_size>
 <use_shared_memory>1</use_shared_memory><shared_memory_size>33554432</shared_memory_size>
 <shared_memory_max_size>134217728</shared_memory_max_size>
-<command>shm_udf_hidden_holes.py</command></function>
+<command>shm_udf_region.py --hide-holes</command></function>
 XML
-shm_local "
-    CREATE USER other IDENTIFIED WITH no_password;
-    GRANT SELECT ON *.* TO other;
-    SYSTEM START LISTEN HTTP;
+shm_local_listening "
     SELECT shm_hidden_holes(1);
-    SELECT * FROM url('http://127.0.0.1:' || toString(getServerPort('http_port'))
-        || '/?user=other&query=' || encodeURLComponent('SELECT shm_hidden_holes(1) SETTINGS max_memory_usage = 50331648, max_untracked_memory = 0'),
-        TSV, 'result String') SETTINGS http_make_head_request = 0, http_max_tries = 1;
+    $(shm_as_user other "SELECT shm_hidden_holes(1) SETTINGS max_memory_usage = 50331648, max_untracked_memory = 0")
     SELECT count() FROM shm_regions;
     SELECT shm_hidden_holes(2);
     SELECT count() FROM shm_regions;
-" --listen_host 127.0.0.1 --http_port 0
+"

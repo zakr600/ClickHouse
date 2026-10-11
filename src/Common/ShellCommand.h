@@ -287,6 +287,17 @@ private:
     /// Set by `killAndReapNoThrow`, which runs once.
     bool kill_and_reap_done = false;
 
+    /// Waits for the child to exit on its own within what is left of the shared termination
+    /// deadline (`remainingTerminationTimeoutMs`). Returns whether it did.
+    bool waitForExitWithinGracePeriod();
+
+    /// Sends `termination_signal` to the child and hands it over to `ShellCommandsHolder`, which
+    /// reaps it once it goes on the signal.
+    void signalAndHandOverChild();
+
+    /// `tryWait`, logging what it throws: for the destructor's path.
+    void tryWaitNoThrow() noexcept;
+
     /// Records that the child has been reaped or is not a child of this process any more
     /// (`child_reaped`): from then on it is neither waited for nor signalled - `wait_called` is set
     /// too, which is what the destructor looks at - and it leaves `UDFProcessRegistry`, whose
@@ -337,12 +348,24 @@ private:
     void killAndReapNoThrow(bool whole_group) noexcept;
     struct tryWaitResult;
 
-    /// `close_streams = false` leaves the child's pipes open after it has been reaped. Only
-    /// `waitDrainingOutput` wants that, and it wants it badly: reaping closes the descriptors, and
-    /// whatever the child had already written and not yet been read is gone with them - including,
-    /// under `stderr_reaction` `throw`, the diagnostic the query was supposed to fail on. The
-    /// caller closes them itself once it has read them to the end.
-    tryWaitResult tryWaitImpl(bool blocking, bool check_exit_status = true, bool close_streams = true);
+    struct TryWaitOptions
+    {
+        /// Whether to wait for the child to exit, rather than only to reap it if it has.
+        bool blocking = true;
+
+        /// `false` reaps the child without decoding its exit status, so a non-zero or signalled
+        /// exit is not raised as an error.
+        bool check_exit_status = true;
+
+        /// `false` leaves the child's pipes open after it has been reaped. Only
+        /// `waitDrainingOutput` wants that, and it wants it badly: reaping closes the descriptors,
+        /// and whatever the child had already written and not yet been read is gone with them -
+        /// including, under `stderr_reaction` `throw`, the diagnostic the query was supposed to fail
+        /// on. The caller closes them itself once it has read them to the end.
+        bool close_streams = true;
+    };
+
+    tryWaitResult tryWaitImpl(const TryWaitOptions & options);
 
     /// Closes everything `tryWaitImpl` would have closed on a reap.
     void closeStreams();
@@ -374,6 +397,24 @@ private:
     /// Whether both output pipes still in `drain_fds` have hung up with nothing left to read.
     bool outputPipesHaveEnded(const int (&drain_fds)[2]) const;
 
+    /// Calls `check_cancelled` of `waitDrainingOutput`, if there is one. If it throws, the
+    /// termination grace period is ended first, so that the destructor can stop the command promptly.
+    void checkCancelled(const std::function<void()> & check_cancelled);
+
+    /// Closes `stdout` for good once `waitDrainingOutput` no longer wants what comes off it (see
+    /// the definition), and drops it from `drain_fds`. Returns whether it was closed here - a
+    /// `stdout` that the command has closed itself is only dropped.
+    bool closeAbandonedStdout(int (&drain_fds)[2], const WaitDrainingOptions & options, size_t stdout_bytes_drained);
+
+    /// Waits up to `timeout_ms` for the child to exit, leaving it unreaped - on `exit_fd`, the
+    /// child's `pidfd`, when there is one.
+    void waitForExitLeavingUnreaped(int exit_fd, UInt64 timeout_ms) const;
+
+    /// The short grace `waitDrainingOutput` gives a child whose output has ended once its budget
+    /// has run out: arms `exit_grace_deadline_ns` on the first call, and waits one step for the
+    /// exit. Returns whether there was any grace left, that is, whether to go on waiting.
+    bool waitInExitGrace(UInt64 & exit_grace_deadline_ns, int exit_fd) const;
+
     void handleProcessRetcode(int retcode) const;
 
     /// Decodes a raw `waitpid` status and throws for anything but a clean zero exit. Separate from
@@ -386,6 +427,15 @@ private:
     static void logCommand(const char * filename, char * const argv[]);
 
     static std::unique_ptr<ShellCommand> executeImpl(const char * filename, char * const argv[], const Config & config);
+
+    /// In the parent, after `vfork`: reads the report of a child that failed before `exec` off the
+    /// read end of its error pipe, `report_fd`, and throws `CANNOT_CREATE_CHILD_PROCESS` for it.
+    /// Returns if the child has started.
+    static void checkChildSetupReport(pid_t child_pid, int report_fd);
+
+    /// The read of the child's error pipe failed with `read_error`: whether the child started is
+    /// established from the child itself. Throws unless it is running.
+    static void handleUnreadableChildReport(pid_t child_pid, int read_error);
 };
 
 

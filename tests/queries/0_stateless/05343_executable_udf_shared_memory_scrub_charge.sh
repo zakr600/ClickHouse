@@ -25,19 +25,14 @@ LIMIT=50331648
     echo "<function><type>executable_pool</type><name>shm_peek</name><return_type>String</return_type>"
     echo "<argument><type>UInt64</type></argument><format>TabSeparated</format><pool_size>1</pool_size>"
     echo "<use_shared_memory>1</use_shared_memory><shared_memory_size>$REGION</shared_memory_size>"
-    echo "<command>shm_udf_peek.py</command></function>"
+    echo "<command>shm_udf_region.py --peek</command></function>"
 } | shm_functions
 
 SCRUBBED="SELECT sum(value) FROM system.events WHERE event = 'ExecutableUDFSharedMemoryScrubbedBytes';"
 
 echo "--- another user borrows the region under a limit it fits once"
-shm_local "
-    CREATE USER other IDENTIFIED WITH no_password;
-    GRANT SELECT ON *.* TO other;
-    SYSTEM START LISTEN HTTP;
+shm_local_listening "
     SELECT shm_peek(1);
-    SELECT * FROM url('http://127.0.0.1:' || toString(getServerPort('http_port'))
-        || '/?user=other&query=' || encodeURLComponent('SELECT shm_peek(1) SETTINGS max_memory_usage = $LIMIT, max_untracked_memory = 0'),
-        TSV, 'result String') SETTINGS http_make_head_request = 0;
+    $(shm_as_user other "SELECT shm_peek(1) SETTINGS max_memory_usage = $LIMIT, max_untracked_memory = 0")
     $SCRUBBED
-" --listen_host 127.0.0.1 --http_port 0
+"

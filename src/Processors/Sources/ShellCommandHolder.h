@@ -1,11 +1,7 @@
 #pragma once
 
-#include <Common/CurrentMetrics.h>
-#include <Common/CurrentThread.h>
-#include <Common/MemoryTracker.h>
 #include <Common/SharedMemoryRegion.h>
 #include <Common/ShellCommand.h>
-#include <Common/logger_useful.h>
 #include <Core/UUID.h>
 #include <Processors/Sources/ShellCommandSource.h>
 
@@ -13,12 +9,6 @@
 #include <memory>
 #include <optional>
 #include <vector>
-
-namespace CurrentMetrics
-{
-    extern const Metric ExecutableUDFSharedMemoryPooledBytes;
-    extern const Metric MemoryTrackingUnmeasured;
-}
 
 namespace DB
 {
@@ -41,37 +31,7 @@ public:
         : func(std::move(func_))
     {}
 
-    ~ShellCommandHolder()
-    {
-        /// The idle worker goes first, before the region and its charge: it holds a descriptor to
-        /// the region, so the pages stay resident for as long as it lives, and a member is only
-        /// destroyed after this body - which would drop the charge while the worker still holds
-        /// the pages, for the whole wait `~ShellCommand` starts with. Its stdin is closed first,
-        /// so that a worker written to exit on EOF does so at once rather than sitting out
-        /// `command_termination_timeout` blocked on its next request. Past that budget a
-        /// shared-memory worker's process group is sent `SIGKILL` and the worker reaped
-        /// (`ShellCommand::Config::own_process_group`), so nothing in it can write into the region
-        /// once the charge below is gone.
-        if (returned_command)
-        {
-            /// `closeInputs` flushes and closes the pipes and throws on failure; this destructor
-            /// must not, and it still has to release the process, the region and its charge.
-            try
-            {
-                returned_command->closeInputs();
-            }
-            catch (...)
-            {
-                tryLogCurrentException("ShellCommandHolder");
-            }
-            returned_command.reset();
-        }
-
-        shared_memory.reset();
-
-        if (persistent_memory_charge)
-            unchargePersistentMemory(persistent_memory_charge);
-    }
+    ~ShellCommandHolder();
 
     /// Whether the next `buildCommand` hands back a process that has already served a borrow. A
     /// caller that has to distinguish "this worker may have left something on its pipes" from "this
@@ -81,28 +41,13 @@ public:
     /// Hands back the process that served the previous borrow, or starts a new one. A new one
     /// inherits the region this holder owns at that moment, so it has to have been created
     /// already (see `getOrCreateSharedMemory`); a returned one inherited it when it was started.
-    std::unique_ptr<ShellCommand> buildCommand()
-    {
-        if (returned_command)
-            return std::move(returned_command);
-
-        return func(inheritedRegionFds());
-    }
+    std::unique_ptr<ShellCommand> buildCommand();
 
     /// The descriptors a process started now has to inherit: the region under child descriptor
     /// `SHARED_MEMORY_CHILD_FD`, which is also the number its request names it by.
-    std::vector<std::pair<int, int>> inheritedRegionFds() const
-    {
-        std::vector<std::pair<int, int>> fds;
-        if (shared_memory)
-            fds.emplace_back(SHARED_MEMORY_CHILD_FD, shared_memory->fd());
-        return fds;
-    }
+    std::vector<std::pair<int, int>> inheritedRegionFds() const;
 
-    void returnCommand(std::unique_ptr<ShellCommand> command)
-    {
-        returned_command = std::move(command);
-    }
+    void returnCommand(std::unique_ptr<ShellCommand> command) { returned_command = std::move(command); }
 
     /// The process that served the previous borrow, still held here, or null if the next
     /// `buildCommand` would start a fresh one. For the probes a borrow runs on a reused worker
@@ -138,18 +83,7 @@ public:
     ///
     /// Creating and growing the region does not charge any memory tracker here: while the holder is
     /// borrowed, the borrowing query owns the charge (see `releaseChargeToBorrower`).
-    SharedMemoryRegionPtr getOrCreateSharedMemory(size_t size, bool & created)
-    {
-        if (!shared_memory)
-        {
-            shared_memory = std::make_shared<SharedMemoryRegion>(size);
-            created = true;
-        }
-        else
-            created = false;
-
-        return shared_memory;
-    }
+    SharedMemoryRegionPtr getOrCreateSharedMemory(size_t size, bool & created);
 
     /// What the region costs - its footprint as `sharedMemoryRegionOverTheCap` last read it, or the
     /// source's own cap check on the same region - or zero if there is none. Lets the borrower charge
@@ -160,22 +94,11 @@ public:
     /// committed pages past its end, all leave the region costing more than the mapping shows, and
     /// those pages cost what any others do (`SharedMemoryRegion::refreshFootprint`). Read at every
     /// borrow and every hand-back, so that whatever the command added is charged from then on.
-    size_t lastSeenSharedMemorySize() const
-    {
-        return shared_memory ? shared_memory->footprint() : 0;
-    }
+    size_t lastSeenSharedMemorySize() const { return shared_memory ? shared_memory->footprint() : 0; }
 
     /// The region if it is over the cap - re-read now (`SharedMemoryRegion::isOverTheCap`) - or
     /// null otherwise. What a borrow checks before it builds anything on the worker.
-    SharedMemoryRegion * sharedMemoryRegionOverTheCap(size_t max_size) const
-    {
-        if (!shared_memory)
-            return nullptr;
-        shared_memory->refreshFootprint();
-        if (shared_memory->isOverTheCap(max_size))
-            return shared_memory.get();
-        return nullptr;
-    }
+    SharedMemoryRegion * sharedMemoryRegionOverTheCap(size_t max_size) const;
 
     /// Drops the returned process and its region together, so that the next `buildCommand` starts
     /// a fresh process with a fresh region. A process and its region live and die together - the
@@ -187,23 +110,7 @@ public:
     /// dropped only after both are gone: the region stays resident until the process has been
     /// signalled and reaped, so it has to stay counted until then. Once the borrower has taken the charge over there is nothing left here
     /// to drop, and the borrower's own charge covers the region until it is gone.
-    void discardWorkerAndRegion() noexcept
-    {
-        /// Nobody waits for how a worker that is thrown away exits: it is signalled at once rather
-        /// than given `command_termination_timeout`, which whoever drops it would sit out.
-        if (returned_command)
-            returned_command->discardWithoutGrace();
-        returned_command.reset();
-        shared_memory.reset();
-
-        if (persistent_memory_charge)
-            unchargePersistentMemory(persistent_memory_charge);
-
-        /// The region the next borrow creates is a fresh, zero-filled file with nobody's data in
-        /// it: there is no previous borrower to scrub it for, and a `memset` of a region that
-        /// is already zero would be a wasted write of its whole size.
-        last_borrower.reset();
-    }
+    void discardWorkerAndRegion() noexcept;
 
     /// A region is charged to one memory tracker at a time, chosen by who can observe it:
     /// while the holder is borrowed, the borrowing query's tracker owns the charge, so the memory
@@ -229,61 +136,107 @@ public:
     /// inspected the returned worker and discarded it if it had to: a discarded worker takes its
     /// charge with it (`discardWorkerAndRegion`), so the region stays counted while the process
     /// is being destroyed.
-    void releaseChargeToBorrower()
-    {
-        if (persistent_memory_charge)
-            unchargePersistentMemory(persistent_memory_charge);
-    }
+    void releaseChargeToBorrower();
 
     /// Restore the idle charge from a footprint measured and capped by the borrower before it
     /// released the query charge. The borrower discards the worker if that measurement fails.
     /// This changes accounting for existing memory and must not throw during cleanup.
-    void acquireChargeFromBorrower(size_t bytes) noexcept
-    {
-        /// A borrow that failed before it took the charge over (`releaseChargeToBorrower`) leaves
-        /// the holder still charging the region, so the charge is brought to the new figure rather
-        /// than added on top of what is there.
-        if (bytes == persistent_memory_charge)
-            return;
-
-        if (bytes > persistent_memory_charge)
-            chargePersistentMemory(bytes - persistent_memory_charge);
-        else
-            unchargePersistentMemory(persistent_memory_charge - bytes);
-    }
+    void acquireChargeFromBorrower(size_t bytes) noexcept;
 
 private:
     /// Straight into the server-wide tracker, past this thread's: no query owns these bytes. And
     /// without the limit: the charge accounts for pages that are there already, so it cannot be
     /// refused - which is also what lets the hand-over be `noexcept`.
-    void chargePersistentMemory(size_t bytes) noexcept
-    {
-        total_memory_tracker.adjustWithUntrackedMemory(static_cast<Int64>(bytes));
-        persistent_memory_charge += bytes;
-        CurrentMetrics::add(CurrentMetrics::MemoryTrackingUnmeasured, static_cast<Int64>(bytes));
+    void chargePersistentMemory(size_t bytes) noexcept;
 
-        /// The same bytes, reported on their own. The server-wide tracker they were just added to
-        /// carries everything else the server allocates as well, so it cannot answer how much of it
-        /// is regions held by idle pooled workers - which is the part an administrator sizing
-        /// `max_server_memory_usage` against a pool has to know, and the only part a test of this
-        /// hand-over can assert exactly.
-        CurrentMetrics::add(CurrentMetrics::ExecutableUDFSharedMemoryPooledBytes, static_cast<Int64>(bytes));
-    }
-
-    void unchargePersistentMemory(size_t bytes) noexcept
-    {
-        total_memory_tracker.adjustWithUntrackedMemory(-static_cast<Int64>(bytes));
-        persistent_memory_charge -= bytes;
-        CurrentMetrics::sub(CurrentMetrics::MemoryTrackingUnmeasured, static_cast<Int64>(bytes));
-
-        CurrentMetrics::sub(CurrentMetrics::ExecutableUDFSharedMemoryPooledBytes, static_cast<Int64>(bytes));
-    }
+    void unchargePersistentMemory(size_t bytes) noexcept;
 
     std::unique_ptr<ShellCommand> returned_command;
     ShellCommandBuilderFunc func;
     SharedMemoryRegionPtr shared_memory;
     std::optional<BorrowerIdentity> last_borrower;
     size_t persistent_memory_charge = 0;
+};
+
+/// A `ShellCommandHolder` borrowed from a `ProcessPool`, together with the pool it goes back to: it
+/// owns the pool's slot for as long as the borrow lasts.
+///
+/// `BorrowedObjectPool` never decrements what it has allocated, so a borrowed holder that is
+/// destroyed instead of being returned costs the pool one slot for good, and after `pool_size` of
+/// such losses every call fails with "Could not get process from pool". Whatever path leaves this
+/// object still owning the holder - an exception between the borrow and the hand-over to a source,
+/// a member initializer of the source that throws, a teardown that throws before it gets to the
+/// return - its destructor returns the holder to the pool. The normal path returns it explicitly
+/// (`returnToPool`), at the point where the teardown has decided what goes back with it; the
+/// destructor is the safety net for every other path, so the holder can be passed and stored like
+/// any other movable value.
+///
+/// What must not outlive the slot has to be gone before the slot is returned: a worker that is not
+/// going back with the holder has to die first, or the query waiting for the slot starts a
+/// replacement while it is still alive (see `cleanup` of the sources). So an owner that holds such
+/// a worker beside this object declares the worker after it, which destroys the worker first.
+///
+/// Empty - owning nothing - when default-constructed, once moved from, and after `returnToPool`.
+/// A command that is not pooled has no borrowed holder, and its object stays empty.
+class BorrowedShellCommandHolder
+{
+public:
+    BorrowedShellCommandHolder() = default;
+
+    BorrowedShellCommandHolder(ShellCommandHolderPtr holder_, std::shared_ptr<ProcessPool> pool_) noexcept
+        : holder(std::move(holder_))
+        , pool(std::move(pool_))
+    {}
+
+    BorrowedShellCommandHolder(BorrowedShellCommandHolder && other) noexcept
+        : holder(std::move(other.holder))
+        , pool(std::move(other.pool))
+    {}
+
+    /// Returns the holder this object owns, if any, before it takes over the other one.
+    BorrowedShellCommandHolder & operator=(BorrowedShellCommandHolder && other) noexcept
+    {
+        if (this != &other)
+        {
+            returnToPool();
+            holder = std::move(other.holder);
+            pool = std::move(other.pool);
+        }
+        return *this;
+    }
+
+    BorrowedShellCommandHolder(const BorrowedShellCommandHolder &) = delete;
+    BorrowedShellCommandHolder & operator=(const BorrowedShellCommandHolder &) = delete;
+
+    ~BorrowedShellCommandHolder() { returnToPool(); }
+
+    /// Hands the holder back to its pool, with the worker it holds at this moment; a no-op for an
+    /// empty object. Never throws (`BorrowedObjectPool::returnObject`).
+    ///
+    /// A holder that goes back without a worker goes back without a region as well: a process and
+    /// its region live and die together (`discardWorkerAndRegion`), and a region left behind would
+    /// be handed - with the data of whoever used it last - to the fresh process the next borrow
+    /// starts. On the normal paths the region is gone already, or the worker was handed back with
+    /// it; this is for a teardown that did not get that far.
+    void returnToPool() noexcept
+    {
+        if (holder)
+        {
+            if (!holder->hasReturnedCommand())
+                holder->discardWorkerAndRegion();
+            pool->returnObject(std::move(holder));
+        }
+        pool.reset();
+    }
+
+    ShellCommandHolder * get() const { return holder.get(); }
+    ShellCommandHolder * operator->() const { return holder.get(); }
+    ShellCommandHolder & operator*() const { return *holder; }
+    explicit operator bool() const { return holder != nullptr; }
+
+private:
+    ShellCommandHolderPtr holder;
+    std::shared_ptr<ProcessPool> pool;
 };
 
 }

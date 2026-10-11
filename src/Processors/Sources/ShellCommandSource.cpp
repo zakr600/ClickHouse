@@ -72,7 +72,7 @@ namespace
     * For each send data task background thread is created. Send data task must send data to process input pipes.
     * ShellCommandPoolSource receives data from process stdout.
     *
-    * If process_pool is passed in constructor then after source is destroyed process is returned to pool.
+    * If a borrowed holder is passed in constructor then after source is destroyed process is returned to pool.
     */
     class ShellCommandSource final : public ISource
     {
@@ -80,8 +80,8 @@ namespace
 
         using SendDataTask = std::function<void()>;
 
-        /// `command_holder_`, `process_pool_` and `worker_is_reused_` are those of a pooled worker;
-        /// null, null and false for a command of its own.
+        /// `command_holder_` and `worker_is_reused_` are those of a pooled worker; empty and false
+        /// for a command of its own.
         ShellCommandSource(
             ContextPtr context_,
             const ShellCommandSourceCoordinator::Configuration & coordinator_configuration,
@@ -89,8 +89,7 @@ namespace
             std::unique_ptr<ShellCommand> && command_,
             std::vector<SendDataTask> && send_data_tasks,
             const ShellCommandSourceConfiguration & configuration_,
-            std::unique_ptr<ShellCommandHolder> && command_holder_,
-            std::shared_ptr<ProcessPool> process_pool_,
+            BorrowedShellCommandHolder && command_holder_,
             bool worker_is_reused_)
             : ISource(std::make_shared<const Block>(sample_block_->cloneEmpty()))
             , context(context_)
@@ -105,17 +104,19 @@ namespace
                   coordinator_configuration.command_read_timeout_milliseconds,
                   coordinator_configuration.stderr_reaction,
                   configuration_.sampler.get())
-            , process_pool(process_pool_)
+            , is_pooled(static_cast<bool>(command_holder_))
             , check_exit_code(coordinator_configuration.check_exit_code)
             , worker_is_reused(worker_is_reused_)
-            , command(std::move(command_))
             , command_holder(std::move(command_holder_))
+            , command(std::move(command_))
         {
-            /// Everything the constructor does lives in this try: a borrowed process holder is
-            /// already owned by this object (the caller's local was moved from in the member
-            /// initializer list above), so an exception that escapes here would destroy it without
-            /// handing it back, and `BorrowedObjectPool` never gives that slot out again. Copying
-            /// the context and changing its settings can throw - MEMORY_LIMIT_EXCEEDED, say.
+            /// Everything the constructor does lives in this try: a borrowed process holder and its
+            /// worker are already owned by this object (the caller's locals were moved from in the
+            /// member initializer list above), so an exception that escapes here would skip
+            /// `cleanup`. The pool's slot would not be lost - `BorrowedShellCommandHolder` returns
+            /// the holder from wherever it is - but the worker would be destroyed rather than
+            /// handed back with it, whatever `cleanup` would have decided about it. Copying the
+            /// context and changing its settings can throw - MEMORY_LIMIT_EXCEEDED, say.
             try
             {
                 context = makeContextForReadingCommandOutput(context, configuration.read_fixed_number_of_rows);
@@ -233,7 +234,7 @@ namespace
             /// executable UDF types measure it differently.
             if (configuration.sampler)
             {
-                if (process_pool)
+                if (is_pooled)
                 {
                     /// Resource accounting must observe the borrow's resident set before
                     /// the worker is torn down or the slot is handed back to the pool —
@@ -253,7 +254,7 @@ namespace
             if (command_is_invalid)
                 command = nullptr;
 
-            if (command_holder && process_pool)
+            if (command_holder)
             {
                 bool valid_command = answeredInFull();
 
@@ -280,7 +281,7 @@ namespace
 
                 command = nullptr;
 
-                process_pool->returnObject(std::move(command_holder));
+                command_holder.returnToPool();
             }
         }
 
@@ -386,7 +387,7 @@ namespace
                 }
 
                 bool wait_for_command = command != nullptr;
-                if (process_pool)
+                if (is_pooled)
                 {
                     bool valid_command = answeredInFull();
 
@@ -517,7 +518,7 @@ namespace
                         {
                             .stderr_sink = {},
                             .check_exit_status = check_exit_code,
-                            .unbounded_status_wait = !process_pool,
+                            .unbounded_status_wait = !is_pooled,
                             .limit_stdout_drain = output_abandoned,
                             .check_cancelled = queryKilledCheck(context),
                         },
@@ -757,9 +758,9 @@ namespace
         /// and it runs both from `cleanup` - which the destructor calls - and from `prepare`, where
         /// failing a query that has already produced its rows over a profiling read would be worse
         /// than losing the measurement.
-        void recordPooledResourceUsageNoThrow() noexcept
+        void recordPooledResourceUsageNoThrow() const noexcept
         {
-            recordPooledReleaseNoThrow(configuration.sampler.get(), process_pool != nullptr, "ShellCommandSource");
+            recordPooledReleaseNoThrow(configuration.sampler.get(), is_pooled, "ShellCommandSource");
         }
 
         ContextPtr context;
@@ -772,7 +773,9 @@ namespace
 
         size_t current_read_rows = 0;
 
-        std::shared_ptr<ProcessPool> process_pool;
+        /// Whether the command is a pooled worker, borrowed with `command_holder`. Not asked of
+        /// `command_holder` itself, which is empty again once `cleanup` has returned it.
+        const bool is_pooled;
 
         bool check_exit_code = false;
 
@@ -801,13 +804,20 @@ namespace
 
         /// Taken over after every other member, because every other member has to be able to throw
         /// without costing a healthy pooled worker: until this object owns these two they still
-        /// belong to `createPipe`, whose scope guard hands them back to the pool. `timeout_command_out`
-        /// allocates its buffer and `pipeline` allocates in its default constructor, so this is not
-        /// a theoretical ordering. Destroyed first for the same reason they are constructed last,
-        /// which is safe: `cleanup` has already joined the send-data threads and handed the command
-        /// back, and ~TimeoutReadBufferFromFileDescriptor deliberately does not touch its descriptors.
+        /// belong to `createPipe`, whose scope guard hands the worker back to its holder. The pool's
+        /// slot does not depend on this order: `BorrowedShellCommandHolder` returns the holder to
+        /// the pool from wherever it is. `timeout_command_out` allocates its buffer and `pipeline`
+        /// allocates in its default constructor, so this is not a theoretical ordering. Destroyed
+        /// first for the same reason they are constructed last, which is safe: `cleanup` has
+        /// already joined the send-data threads and handed the command back, and
+        /// ~TimeoutReadBufferFromFileDescriptor deliberately does not touch its descriptors.
+        ///
+        /// The holder is declared before the command, so the command is destroyed before it: on a
+        /// path on which `cleanup` did not get to return the holder, its destructor does, and a
+        /// worker that is not going back with it has to die before its slot is released (see
+        /// `cleanup`).
+        BorrowedShellCommandHolder command_holder;
         std::unique_ptr<ShellCommand> command;
-        ShellCommandHolderPtr command_holder;
     };
 
     class SendingChunkHeaderTransform final : public ISimpleTransform
@@ -908,16 +918,18 @@ ShellCommandHolder::ShellCommandBuilderFunc makeCommandBuilder(
 }
 
 /// Borrows a holder from the pool, waiting up to `max_command_execution_time`; a holder the pool
-/// allocates anew starts its processes with `build_process`.
-ShellCommandHolderPtr borrowHolderFromPool(
-    ProcessPool & process_pool,
+/// allocates anew starts its processes with `build_process`. The holder is owned by a
+/// `BorrowedShellCommandHolder` from the moment it is borrowed, so whatever throws after that
+/// returns it to the pool.
+BorrowedShellCommandHolder borrowHolderFromPool(
+    const std::shared_ptr<ProcessPool> & process_pool,
     const ShellCommandSourceCoordinator::Configuration & configuration,
     const ShellCommandHolder::ShellCommandBuilderFunc & build_process,
     UDFProcessSubtreeSampler * sampler)
 {
-    ShellCommandHolderPtr holder;
-    bool result = process_pool.tryBorrowObject(
-        holder,
+    ShellCommandHolderPtr borrowed;
+    bool result = process_pool->tryBorrowObject(
+        borrowed,
         [&build_process]() { return std::make_unique<ShellCommandHolder>(ShellCommandHolder::ShellCommandBuilderFunc(build_process)); },
         /// Saturated rather than wrapped: a huge `max_command_execution_time`, meant as "wait
         /// forever", must not come out as a fraction of a second. The pool saturates the
@@ -925,6 +937,9 @@ ShellCommandHolderPtr borrowHolderFromPool(
         configuration.max_command_execution_time_seconds > std::numeric_limits<size_t>::max() / 1000
             ? std::numeric_limits<size_t>::max()
             : configuration.max_command_execution_time_seconds * 1000);
+
+    /// Empty when the borrow timed out.
+    BorrowedShellCommandHolder holder(std::move(borrowed), process_pool);
 
     /// Pool wait is frozen here on both the success and the timeout-failure
     /// paths so that `PoolWaitMicroseconds` always records contention for a
@@ -1104,38 +1119,36 @@ Pipe ShellCommandSourceCoordinator::createPipe(
     auto build_process = makeCommandBuilder(
         configuration, command, arguments, input_pipes.size(), /*collect_resource_usage=*/ !is_executable_pool && sampler != nullptr);
 
+    /// Declared before `process`, so that a process that is still here when this function exits is
+    /// destroyed before the holder returns to the pool: a worker that is not going back with the
+    /// holder has to die before its slot is released, as in the sources' `cleanup`.
+    BorrowedShellCommandHolder process_holder;
     std::unique_ptr<ShellCommand> process;
-    ShellCommandHolderPtr process_holder;
 
     /// Whether the process below has already served a borrow, and may therefore have left something
     /// on its pipes - see `ShellCommandSource::quarantineReusedWorker`.
     bool worker_is_reused = false;
 
     /// A borrowed holder is handed over to the source below, which returns it to the pool when the
-    /// query is done. Until that hand-over happens the holder is only this local, and anything that
-    /// throws in between - building the command, or a member initializer of the source, which runs
-    /// before the source's own constructor cleanup can take over - would destroy it without
-    /// returning it. `BorrowedObjectPool` never decrements what it has allocated, so each such loss
-    /// permanently costs the pool one slot, and after `pool_size` of them every call fails with
-    /// "Could not get process from pool". The guard fires only while the local still owns the
-    /// holder: on the normal path the source has taken it and this is a no-op.
+    /// query is done. Until that hand-over happens the holder is only this local, and anything can
+    /// throw in between - building the command, or a member initializer of the source, which runs
+    /// before the source's own constructor cleanup can take over. The holder itself goes back to
+    /// the pool all the same, when `process_holder` is destroyed (`BorrowedShellCommandHolder`);
+    /// what this guard adds is the worker. It fires only while the local still owns the holder: on
+    /// the normal path the source has taken it and this is a no-op.
     SCOPE_EXIT_SAFE({
-        if (process_holder)
-        {
-            /// Hand the worker back to its holder as well when the source never took it: nothing
-            /// was sent to it, so it is still at a clean protocol boundary, and killing it would
-            /// cost the next query a process spawn over a failure that never reached this one.
-            /// Handed back as it was borrowed, as by the source's own constructor cleanup: the send
-            /// tasks prepared below make its input descriptors non-blocking, and a worker whose
-            /// descriptors cannot be restored is not handed back.
-            if (process && restoreBlockingInputs(*process))
-                process_holder->returnCommand(std::move(process));
-            process_pool->returnObject(std::move(process_holder));
-        }
+        /// Hand the worker back to its holder as well when the source never took it: nothing
+        /// was sent to it, so it is still at a clean protocol boundary, and killing it would
+        /// cost the next query a process spawn over a failure that never reached this one.
+        /// Handed back as it was borrowed, as by the source's own constructor cleanup: the send
+        /// tasks prepared below make its input descriptors non-blocking, and a worker whose
+        /// descriptors cannot be restored is not handed back.
+        if (process_holder && process && restoreBlockingInputs(*process))
+            process_holder->returnCommand(std::move(process));
     });
 
     if (is_executable_pool)
-        process_holder = borrowHolderFromPool(*process_pool, configuration, build_process, sampler);
+        process_holder = borrowHolderFromPool(process_pool, configuration, build_process, sampler);
 
     if (configuration.use_shared_memory)
     {
@@ -1143,7 +1156,7 @@ Pipe ShellCommandSourceCoordinator::createPipe(
         /// process inherits the region's descriptor at `exec`, so it has to exist first. Doing
         /// it there also means a failure anywhere along the way - reserving a region, charging its
         /// memory, starting the process - is handled by the source's constructor cleanup, which
-        /// returns the borrowed holder to the pool instead of permanently shrinking its capacity.
+        /// decides what goes back to the pool with the borrowed holder.
         return createShellCommandSharedMemoryPipe(
             context,
             configuration,
@@ -1151,8 +1164,7 @@ Pipe ShellCommandSourceCoordinator::createPipe(
             std::move(build_process),
             std::move(input_pipes[0]),
             source_configuration,
-            std::move(process_holder),
-            process_pool);
+            std::move(process_holder));
     }
 
     if (is_executable_pool)
@@ -1179,7 +1191,6 @@ Pipe ShellCommandSourceCoordinator::createPipe(
         std::move(tasks),
         source_configuration,
         std::move(process_holder),
-        process_pool,
         worker_is_reused);
 
     return Pipe(std::move(source));

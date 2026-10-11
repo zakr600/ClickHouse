@@ -143,7 +143,7 @@ void ShellCommandsHolder::runReaper()
 
                 fds.clear();
                 fds.push_back({.fd = reaper_wakeup.fds_rw[0], .events = POLLIN, .revents = 0});
-                for (pid_t pid : signalled_children)
+                for ([[maybe_unused]] pid_t pid : signalled_children)
                 {
                     int pidfd = -1;
 #if defined(OS_LINUX)

@@ -1,133 +1,82 @@
 #!/usr/bin/python3
 
-# Executable UDF that exchanges data through a shared-memory file instead of the pipes.
-#
-# Protocol (all control values use the ClickHouse native binary encoding):
-#   server -> stdin : varint version, varint request id, varint path length + path bytes,
-#                     varint input offset, varint input size
-#   stdout <- server: the request id echoed back, varint status (0 = ok), then on success
-#                     varint output offset + varint output size; status 2 asks the server for a
-#                     larger region and is followed by the varint total size needed; any other
-#                     status is followed by a length-prefixed error message
-# The bulk data lives in the shared-memory file at the given path; the pipes carry only
-# these small control commands. When stdin reaches EOF the process exits.
+# Executable UDF that exchanges data through a shared-memory file instead of the pipes (the protocol
+# is in `shm_protocol.py`). It answers every row of its `TabSeparated` input - one `UInt64` per line
+# - with `Key <row>`, written right after the input, and exits when stdin reaches EOF. The flags
+# change what it answers; the commands that also do something else are `shm_udf_noisy.py` (writes
+# besides the answer), `shm_udf_region.py` (changes to the region's file) and `shm_udf_broken.py`
+# (never answers properly).
 
-import mmap
+import argparse
 import os
 import sys
+import time
 
 # CI runs Python with `PYTHONSAFEPATH`, which keeps the script's own directory out of `sys.path`.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from shm_protocol import (  # noqa: E402
-    PROTOCOL_VERSION,
-    STATUS_ERROR,
-    STATUS_NEED_MORE_SPACE,
-    STATUS_OK,
-    read_varint,
-    write_string_binary,
-    write_varint,
-)
+from shm_protocol import key_row, pid_row, place_answer, serve  # noqa: E402
+
+parser = argparse.ArgumentParser()
+# Each row is answered with itself, so the query decides whether the answer parses as the return type.
+parser.add_argument("--echo", action="store_true")
+parser.add_argument("--report-pid", action="store_true")
+# A function without arguments: the request carries no input at all (offset 0, size 0) and the answer
+# is one row that depends on none. The server still has to make that request - there is nothing else
+# that would make this command produce a row.
+parser.add_argument("--zero-argument", action="store_true")
+# Answers the first row only: too few rows.
+parser.add_argument("--first-row-only", action="store_true")
+# Answers every row twice: more rows than requested. The server must detect the overproduction, fail
+# the query with a "wrong result" error, and (for `executable_pool`) invalidate the worker instead of
+# returning it to the pool as valid.
+parser.add_argument("--duplicate-rows", action="store_true")
+# Writes the answer at offset 0, over the already-consumed input, instead of right after it. With
+# `--echo` the answer is exactly as large as the input, so it always fits into a region that the
+# server has just grown to hold the input - which lets a test drive region growth without also having
+# to reserve room for a larger output.
+parser.add_argument("--answer-at-start", action="store_true")
+# A line on stderr before the first request is ever read: what a command that logs its startup
+# writes. It belongs to the query that started the process, and under `stderr_reaction` `throw` it
+# fails that query - the process is new, so there is no earlier invocation for the server to pin it on.
+parser.add_argument("--stderr-at-startup", action="store_true")
+# Takes its time over cleanup: on stdin EOF - the server telling it to exit - it stays alive for the
+# given number of seconds, past `command_termination_timeout`, and only then exits successfully. A
+# non-pooled command is waited for until it exits when its exit code is checked, whatever transport it
+# uses, so such a command passes.
+parser.add_argument("--linger", type=float, metavar="SECONDS")
+args = parser.parse_args()
 
 
-class NeedMoreSpace(Exception):
-    def __init__(self, required_size):
-        super().__init__(
-            f"the shared-memory region must be at least {required_size} bytes"
-        )
-        self.required_size = required_size
+def answer_row(row):
+    if args.echo:
+        output = row + b"\n"
+    elif args.report_pid:
+        output = pid_row(row)
+    else:
+        output = key_row(row)
+    return output * 2 if args.duplicate_rows else output
 
 
-def process(input_data, region, region_size):
-    # A function without arguments: the request carries no input at all (offset 0, size 0) and the
-    # answer is one row that depends on none. The server still has to make that request - there is
-    # nothing else that would make this command produce a row.
-    if "--zero-argument" in sys.argv:
-        output = b"42\n"
-        output_offset = len(input_data)
-        if output_offset + len(output) > region_size:
-            raise NeedMoreSpace(output_offset + len(output))
-        region[output_offset : output_offset + len(output)] = output
-        region.flush()
-        return output_offset, len(output)
+def answer(input_data, region):
+    if args.zero_argument:
+        return place_answer(region, len(input_data), b"42\n")
 
-    # Input format is TabSeparated: one UInt64 per line. With `--echo` each row is answered with
-    # itself, so the query decides whether the answer parses as the return type.
-    output = bytearray()
-    for line in input_data.split(b"\n"):
-        if line == b"":
-            continue
-        if "--echo" in sys.argv:
-            output += line + b"\n"
-        elif "--report-pid" in sys.argv:
-            output += str(os.getpid()).encode("ascii") + b"\n"
-        else:
-            output += b"Key " + line + b"\n"
-
-    output_offset = len(input_data)  # write the result right after the input
-    if output_offset + len(output) > region_size:
-        # Only the server can resize the region: ask it for one that fits and it re-sends the
-        # same request over the larger mapping.
-        raise NeedMoreSpace(output_offset + len(output))
-
-    region[output_offset : output_offset + len(output)] = bytes(output)
-    region.flush()
-    return output_offset, len(output)
+    rows = [row for row in input_data.split(b"\n") if row != b""]
+    if args.first_row_only:
+        rows = rows[:1]
+    output = b"".join(answer_row(row) for row in rows)
+    return place_answer(region, 0 if args.answer_at_start else len(input_data), output)
 
 
 def main():
-    stdin = sys.stdin.buffer
-    stdout = sys.stdout.buffer
-
-    # A line on stderr before the first request is ever read: what a command that logs its startup
-    # writes. It belongs to the query that started the process, and under `stderr_reaction`
-    # `throw` it fails that query - the process is new, so there is no earlier invocation for the
-    # server to pin it on.
-    if "--stderr-at-startup" in sys.argv:
+    if args.stderr_at_startup:
         sys.stderr.write("starting up\n")
         sys.stderr.flush()
 
-    while True:
-        version = read_varint(stdin)
-        if version is None:
-            break  # stdin closed -> exit
-        request_id = read_varint(stdin)
+    serve(answer)
 
-        path_length = read_varint(stdin)
-        path = stdin.read(path_length).decode("utf-8")
-        input_offset = read_varint(stdin)
-        input_size = read_varint(stdin)
-
-        try:
-            if version != PROTOCOL_VERSION:
-                raise ValueError(f"unsupported protocol version {version}")
-
-            fd = os.open(path, os.O_RDWR)
-            try:
-                region = mmap.mmap(fd, 0)
-            finally:
-                os.close(fd)
-
-            try:
-                region_size = len(region)
-                input_data = region[input_offset : input_offset + input_size]
-                output_offset, output_size = process(input_data, region, region_size)
-            finally:
-                region.close()
-
-            write_varint(stdout, request_id)
-            write_varint(stdout, STATUS_OK)
-            write_varint(stdout, output_offset)
-            write_varint(stdout, output_size)
-        except NeedMoreSpace as need_more_space:
-            write_varint(stdout, request_id)
-            write_varint(stdout, STATUS_NEED_MORE_SPACE)
-            write_varint(stdout, need_more_space.required_size)
-        except Exception as exception:  # noqa: BLE001
-            write_varint(stdout, request_id)
-            write_varint(stdout, STATUS_ERROR)
-            write_string_binary(stdout, str(exception))
-
-        stdout.flush()
+    if args.linger is not None:
+        time.sleep(args.linger)
 
 
 if __name__ == "__main__":

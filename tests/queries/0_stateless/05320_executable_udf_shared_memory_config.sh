@@ -13,7 +13,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=./shm_udf_scripts/common.sh
 . "$CUR_DIR"/shm_udf_scripts/common.sh
 
-function shm_function()
+function config_function()
 {
     # name, type, the options that make it what it is
     echo "<function><type>$2</type><name>$1</name><return_type>String</return_type>"
@@ -22,33 +22,33 @@ function shm_function()
 }
 
 {
-    shm_function shm_ok executable "<use_shared_memory>1</use_shared_memory><shared_memory_size>1048576</shared_memory_size>"
-    shm_function shm_grow executable \
+    config_function shm_ok executable "<use_shared_memory>1</use_shared_memory><shared_memory_size>1048576</shared_memory_size>"
+    config_function shm_grow executable \
         "<use_shared_memory>1</use_shared_memory><shared_memory_size>16</shared_memory_size><shared_memory_max_size>1048576</shared_memory_max_size>"
-    shm_function shm_pool executable_pool \
+    config_function shm_pool executable_pool \
         "<use_shared_memory>1</use_shared_memory><shared_memory_size>1048576</shared_memory_size>"
 
-    shm_function bad_chunk_header executable \
+    config_function bad_chunk_header executable \
         "<use_shared_memory>1</use_shared_memory><shared_memory_size>1048576</shared_memory_size><send_chunk_header>1</send_chunk_header>"
     # Every shared-memory-only key is refused without `use_shared_memory`: accepting it would let a
     # function that was explicitly configured for shared memory run over the pipes instead. The
     # rejection is on the key being present, not on its value - a knob written out at its own
     # default says just as clearly that its author believed the function used shared memory.
-    shm_function bad_size_no_shm executable "<shared_memory_size>1048576</shared_memory_size>"
-    shm_function bad_max_size_default_no_shm executable "<shared_memory_max_size>0</shared_memory_max_size>"
-    shm_function bad_max_size_no_shm executable "<shared_memory_max_size>1048576</shared_memory_max_size>"
-    shm_function bad_max_lt_size executable \
+    config_function bad_size_no_shm executable "<shared_memory_size>1048576</shared_memory_size>"
+    config_function bad_max_size_default_no_shm executable "<shared_memory_max_size>0</shared_memory_max_size>"
+    config_function bad_max_size_no_shm executable "<shared_memory_max_size>1048576</shared_memory_max_size>"
+    config_function bad_max_lt_size executable \
         "<use_shared_memory>1</use_shared_memory><shared_memory_size>1048576</shared_memory_size><shared_memory_max_size>524288</shared_memory_max_size>"
     # The size is the one thing the transport cannot default: a missing one and an explicit zero are
     # both a region of nothing.
-    shm_function bad_no_size executable "<use_shared_memory>1</use_shared_memory>"
-    shm_function bad_zero_size executable "<use_shared_memory>1</use_shared_memory><shared_memory_size>0</shared_memory_size>"
+    config_function bad_no_size executable "<use_shared_memory>1</use_shared_memory>"
+    config_function bad_zero_size executable "<use_shared_memory>1</use_shared_memory><shared_memory_size>0</shared_memory_size>"
     # Past the signed range (`Int64`, `off_t`): it must never reach the memory tracker or `ftruncate`.
-    shm_function bad_huge executable \
+    config_function bad_huge executable \
         "<use_shared_memory>1</use_shared_memory><shared_memory_size>18446744073709551615</shared_memory_size>"
     # The largest size the signed range admits - but a file holds whole pages, and the charge for it
     # is the next page boundary, one past the signed range.
-    shm_function bad_int64_max executable \
+    config_function bad_int64_max executable \
         "<use_shared_memory>1</use_shared_memory><shared_memory_size>9223372036854775807</shared_memory_size>"
 } | shm_functions
 

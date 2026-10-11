@@ -24,7 +24,7 @@ shm_functions <<EOF
     <pool_size>1</pool_size>
     <stderr_reaction>log_last</stderr_reaction>
     <command_read_timeout>5000</command_read_timeout>
-    <command>pipe_pool_stderr_flood_after_gap.py --go $GO --pipe-pages 2 --bytes $BURST_BYTES</command>
+    <command>pipe_pool_pid.py --go $GO --after-go stderr-flood --pipe-pages 2 --bytes $BURST_BYTES</command>
 </function>
 EOF
 

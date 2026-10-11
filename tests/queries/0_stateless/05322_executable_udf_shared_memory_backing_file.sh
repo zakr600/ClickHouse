@@ -16,7 +16,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=./shm_udf_scripts/common.sh
 . "$CUR_DIR"/shm_udf_scripts/common.sh
 
-function shm_function()
+function shm_pool_function()
 {
     # name, argument type, the options that make it what it is, the command
     echo "<function><type>executable_pool</type><name>$1</name><return_type>String</return_type>"
@@ -25,29 +25,29 @@ function shm_function()
 }
 
 {
-    # `shm_udf_extend.py` doubles the file on every request - or stretches it to a page, given `page`.
-    shm_function shm_extend UInt64 \
-        "<shared_memory_size>4194304</shared_memory_size><shared_memory_max_size>67108864</shared_memory_max_size>" shm_udf_extend.py
-    shm_function shm_extend_past_cap UInt64 "<shared_memory_size>4194304</shared_memory_size>" shm_udf_extend.py
-    shm_function shm_extend_tiny UInt64 "<shared_memory_size>28</shared_memory_size>" "shm_udf_extend.py page"
-    # `shm_udf_alloc_beyond_eof.py` commits pages past the end of the file: twice the file's length
+    # `--extend` doubles the file on every request - or stretches it to a page, given `page`.
+    shm_pool_function shm_extend UInt64 \
+        "<shared_memory_size>4194304</shared_memory_size><shared_memory_max_size>67108864</shared_memory_max_size>" "shm_udf_region.py --extend double"
+    shm_pool_function shm_extend_past_cap UInt64 "<shared_memory_size>4194304</shared_memory_size>" "shm_udf_region.py --extend double"
+    shm_pool_function shm_extend_tiny UInt64 "<shared_memory_size>28</shared_memory_size>" "shm_udf_region.py --extend page"
+    # `--alloc-beyond-eof` commits pages past the end of the file: twice the file's length
     # right past it, or - given an offset - whole pages of the given amount there, after stretching
     # the file to the given length.
-    shm_function shm_alloc_beyond_eof UInt64 "<shared_memory_size>1572864</shared_memory_size>" shm_udf_alloc_beyond_eof.py
-    shm_function shm_alloc_within_cap UInt64 \
-        "<shared_memory_size>40</shared_memory_size><shared_memory_max_size>1835008</shared_memory_max_size>" shm_udf_alloc_beyond_eof.py
-    shm_function shm_alloc_far UInt64 \
-        "<shared_memory_size>56</shared_memory_size><shared_memory_max_size>1835008</shared_memory_max_size>" "shm_udf_alloc_beyond_eof.py 1048576"
-    shm_function shm_alloc_far_filling String \
-        "<shared_memory_size>72</shared_memory_size><shared_memory_max_size>1835008</shared_memory_max_size>" "shm_udf_alloc_beyond_eof.py 1572864 262144"
-    shm_function shm_alloc_far_during_request String \
-        "<shared_memory_size>4096</shared_memory_size><shared_memory_max_size>1048576</shared_memory_max_size>" "shm_udf_alloc_beyond_eof.py 1048576 512000"
-    shm_function shm_sparse UInt64 \
-        "<shared_memory_size>88</shared_memory_size><shared_memory_max_size>2097152</shared_memory_max_size>" "shm_udf_alloc_beyond_eof.py 2097152 2093056 2097152"
-    shm_function shm_tiny UInt64 "<shared_memory_size>24</shared_memory_size>" shm_udf.py
-    shm_function shm_punch_hole UInt64 "<shared_memory_size>1310720</shared_memory_size>" shm_udf_punch_hole.py
-    shm_function shm_report_size UInt64 \
-        "<shared_memory_size>65536</shared_memory_size><shared_memory_max_size>131072</shared_memory_max_size>" "shm_udf_report_size.py --extend-to 131072"
+    shm_pool_function shm_alloc_beyond_eof UInt64 "<shared_memory_size>1572864</shared_memory_size>" "shm_udf_region.py --alloc-beyond-eof"
+    shm_pool_function shm_alloc_within_cap UInt64 \
+        "<shared_memory_size>40</shared_memory_size><shared_memory_max_size>1835008</shared_memory_max_size>" "shm_udf_region.py --alloc-beyond-eof"
+    shm_pool_function shm_alloc_far UInt64 \
+        "<shared_memory_size>56</shared_memory_size><shared_memory_max_size>1835008</shared_memory_max_size>" "shm_udf_region.py --alloc-beyond-eof 1048576"
+    shm_pool_function shm_alloc_far_filling String \
+        "<shared_memory_size>72</shared_memory_size><shared_memory_max_size>1835008</shared_memory_max_size>" "shm_udf_region.py --alloc-beyond-eof 1572864 262144"
+    shm_pool_function shm_alloc_far_during_request String \
+        "<shared_memory_size>4096</shared_memory_size><shared_memory_max_size>1048576</shared_memory_max_size>" "shm_udf_region.py --alloc-beyond-eof 1048576 512000"
+    shm_pool_function shm_sparse UInt64 \
+        "<shared_memory_size>88</shared_memory_size><shared_memory_max_size>2097152</shared_memory_max_size>" "shm_udf_region.py --alloc-beyond-eof 2097152 2093056 2097152"
+    shm_pool_function shm_tiny UInt64 "<shared_memory_size>24</shared_memory_size>" shm_udf.py
+    shm_pool_function shm_punch_hole UInt64 "<shared_memory_size>1310720</shared_memory_size>" "shm_udf_region.py --punch-hole"
+    shm_pool_function shm_report_size UInt64 \
+        "<shared_memory_size>65536</shared_memory_size><shared_memory_max_size>131072</shared_memory_max_size>" "shm_udf_region.py --report-size 131072"
 } | shm_functions
 
 P=$SHM_PAGE

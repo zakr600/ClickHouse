@@ -6,6 +6,7 @@
 #include <Common/logger_useful.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ProcessList.h>
+#include <base/errnoToString.h>
 
 namespace DB
 {

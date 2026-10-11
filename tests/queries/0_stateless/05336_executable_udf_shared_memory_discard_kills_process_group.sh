@@ -30,25 +30,9 @@ shm_local "
     SELECT sum(value) FROM system.events WHERE event = 'ExecutableUDFSharedMemoryDirtyChannelDiscards';
 "
 
-# Gone, or a zombie waiting to be reaped - either way it runs no code. A killed process is torn down
-# by the kernel right after the signal, so the wait is for that, bounded.
-function running()
-{
-    local state
-    for _ in $(seq 1 50); do
-        state=$(awk '{ print $3 }' "/proc/$1/stat" 2>/dev/null)
-        if [[ -z "$state" || "$state" == Z ]]; then
-            echo "gone"
-            return
-        fi
-        sleep 0.1
-    done
-    echo "running"
-}
-
 for name in worker descendant; do
     if [[ -f "$SHM_UDF_WORK/$name" ]]; then
-        echo "$name: $(running "$(cat "$SHM_UDF_WORK/$name")")"
+        echo "$name: $(shm_process_state "$(cat "$SHM_UDF_WORK/$name")")"
     else
         echo "$name: no pid"
     fi

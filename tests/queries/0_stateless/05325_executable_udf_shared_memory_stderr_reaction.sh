@@ -14,33 +14,25 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=./shm_udf_scripts/common.sh
 . "$CUR_DIR"/shm_udf_scripts/common.sh
 
-function shm_function()
-{
-    # name, type, the options that make it what it is, the command
-    echo "<function><type>$2</type><name>$1</name><return_type>String</return_type>"
-    echo "<argument><type>UInt64</type></argument><format>TabSeparated</format>"
-    echo "<use_shared_memory>1</use_shared_memory>$3<command>$4</command></function>"
-}
-
 {
     shm_function shm_stderr_at_startup executable_pool \
         "<pool_size>1</pool_size><stderr_reaction>throw</stderr_reaction><shared_memory_size>4096</shared_memory_size>" "shm_udf.py --stderr-at-startup"
-    shm_function shm_stderr_then_exit executable "<stderr_reaction>throw</stderr_reaction><shared_memory_size>16777216</shared_memory_size>" shm_udf_stderr_then_exit.py
-    shm_function shm_on_the_way_out executable "<stderr_reaction>throw</stderr_reaction><shared_memory_size>4096</shared_memory_size>" shm_udf_stderr_on_the_way_out.py
+    shm_function shm_stderr_then_exit executable "<stderr_reaction>throw</stderr_reaction><shared_memory_size>16777216</shared_memory_size>" "shm_udf_noisy.py --after-answer stderr-then-exit"
+    shm_function shm_on_the_way_out executable "<stderr_reaction>throw</stderr_reaction><shared_memory_size>4096</shared_memory_size>" "shm_udf_noisy.py --after-answer stderr-on-the-way-out"
     shm_function shm_on_the_way_out_no_exit_check executable \
-        "<stderr_reaction>throw</stderr_reaction><check_exit_code>0</check_exit_code><shared_memory_size>4096</shared_memory_size>" shm_udf_stderr_on_the_way_out.py
-    shm_function shm_lingers executable "<command_termination_timeout>2</command_termination_timeout><shared_memory_size>4096</shared_memory_size>" shm_udf_lingers.py
+        "<stderr_reaction>throw</stderr_reaction><check_exit_code>0</check_exit_code><shared_memory_size>4096</shared_memory_size>" "shm_udf_noisy.py --after-answer stderr-on-the-way-out"
+    shm_function shm_lingers executable "<command_termination_timeout>2</command_termination_timeout><shared_memory_size>4096</shared_memory_size>" "shm_udf.py --linger 4"
     shm_function shm_lingers_no_exit_check executable \
-        "<command_termination_timeout>2</command_termination_timeout><check_exit_code>0</check_exit_code><shared_memory_size>4096</shared_memory_size>" shm_udf_lingers.py
-    shm_function shm_quiet_stderr_stalls executable "<command_read_timeout>2000</command_read_timeout><command_termination_timeout>1</command_termination_timeout><shared_memory_size>4096</shared_memory_size>" shm_udf_quiet_stderr_stalls.py
+        "<command_termination_timeout>2</command_termination_timeout><check_exit_code>0</check_exit_code><shared_memory_size>4096</shared_memory_size>" "shm_udf.py --linger 4"
+    shm_function shm_quiet_stderr_stalls executable "<command_read_timeout>2000</command_read_timeout><command_termination_timeout>1</command_termination_timeout><shared_memory_size>4096</shared_memory_size>" "shm_udf_broken.py --stall quiet"
     shm_function shm_chatty_stderr_stalls executable \
-        "<command_read_timeout>2000</command_read_timeout><command_termination_timeout>1</command_termination_timeout><stderr_reaction>none</stderr_reaction><shared_memory_size>4096</shared_memory_size>" shm_udf_chatty_stderr_stalls.py
-    shm_function shm_stderr_after_stdout executable "<stderr_reaction>none</stderr_reaction><shared_memory_size>4096</shared_memory_size>" shm_udf_stderr_after_stdout.py
+        "<command_read_timeout>2000</command_read_timeout><command_termination_timeout>1</command_termination_timeout><stderr_reaction>none</stderr_reaction><shared_memory_size>4096</shared_memory_size>" "shm_udf_broken.py --stall chatty"
+    shm_function shm_stderr_after_stdout executable "<stderr_reaction>none</stderr_reaction><shared_memory_size>4096</shared_memory_size>" "shm_udf_noisy.py --after-answer stderr-flood-on-the-way-out"
     shm_function shm_chatty_stderr_throw executable_pool \
-        "<pool_size>1</pool_size><stderr_reaction>throw</stderr_reaction><shared_memory_size>16777216</shared_memory_size>" shm_udf_chatty_stderr.py
+        "<pool_size>1</pool_size><stderr_reaction>throw</stderr_reaction><shared_memory_size>16777216</shared_memory_size>" "shm_udf_noisy.py --report-pid --stderr-before-frame line"
     shm_function shm_chatty_stderr_no_exit_check executable_pool \
         "<pool_size>1</pool_size><check_exit_code>0</check_exit_code><stderr_reaction>throw</stderr_reaction><shared_memory_size>16777216</shared_memory_size>" \
-        shm_udf_chatty_stderr.py
+        "shm_udf_noisy.py --report-pid --stderr-before-frame line"
 } | shm_functions
 
 # The output of a query whose answer is a single row of half a million: parsing those out of the

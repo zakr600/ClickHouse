@@ -21,27 +21,27 @@ function pipe_function()
 }
 
 {
-    pipe_function pipe_on_the_way_out executable "<stderr_reaction>throw</stderr_reaction>" pipe_stderr_on_the_way_out.py
+    pipe_function pipe_on_the_way_out executable "<stderr_reaction>throw</stderr_reaction>" "pipe_udf.py --close-stdout --pause 1 --stderr-on-the-way-out"
     pipe_function pipe_on_the_way_out_no_exit_check executable \
-        "<stderr_reaction>throw</stderr_reaction><check_exit_code>0</check_exit_code>" pipe_stderr_on_the_way_out.py
-    pipe_function pipe_lingers executable "<command_termination_timeout>2</command_termination_timeout>" pipe_lingers.py
+        "<stderr_reaction>throw</stderr_reaction><check_exit_code>0</check_exit_code>" "pipe_udf.py --close-stdout --pause 1 --stderr-on-the-way-out"
+    pipe_function pipe_lingers executable "<command_termination_timeout>2</command_termination_timeout>" "pipe_udf.py --close-stdout --pause 4"
     pipe_function pipe_lingers_no_exit_check executable \
-        "<command_termination_timeout>2</command_termination_timeout><check_exit_code>0</check_exit_code>" pipe_lingers.py
+        "<command_termination_timeout>2</command_termination_timeout><check_exit_code>0</check_exit_code>" "pipe_udf.py --close-stdout --pause 4"
     pipe_function pipe_lingers_no_exit_check_no_grace executable \
-        "<command_termination_timeout>0</command_termination_timeout><check_exit_code>0</check_exit_code>" pipe_lingers.py
-    pipe_function pipe_exit_after_a_moment executable "<command_termination_timeout>0</command_termination_timeout>" pipe_exit_after_a_moment.py
+        "<command_termination_timeout>0</command_termination_timeout><check_exit_code>0</check_exit_code>" "pipe_udf.py --close-stdout --pause 4"
+    pipe_function pipe_exit_after_a_moment executable "<command_termination_timeout>0</command_termination_timeout>" "pipe_udf.py --close-stdout --pause 0.3"
     pipe_function pipe_stray_stdout_then_stderr executable \
-        "<check_exit_code>0</check_exit_code><stderr_reaction>throw</stderr_reaction>" pipe_stray_stdout_then_stderr.py
+        "<check_exit_code>0</check_exit_code><stderr_reaction>throw</stderr_reaction>" "pipe_udf.py --pause 0.3 --stray-stdout --stderr-on-the-way-out"
     pipe_function pipe_pool_lingers executable_pool \
-        "<pool_size>1</pool_size><command_termination_timeout>2</command_termination_timeout>" pipe_pool_lingers.py
+        "<pool_size>1</pool_size><command_termination_timeout>2</command_termination_timeout>" "pipe_udf.py --first-row-only --no-newline --close-stdout --linger"
     pipe_function pipe_pool_lingers_no_exit_check executable_pool \
-        "<pool_size>1</pool_size><command_termination_timeout>2</command_termination_timeout><check_exit_code>0</check_exit_code>" pipe_pool_lingers.py
+        "<pool_size>1</pool_size><command_termination_timeout>2</command_termination_timeout><check_exit_code>0</check_exit_code>" "pipe_udf.py --first-row-only --no-newline --close-stdout --linger"
     pipe_function pipe_pool_lingers_no_grace executable_pool \
-        "<pool_size>1</pool_size><command_termination_timeout>0</command_termination_timeout>" pipe_pool_lingers.py
+        "<pool_size>1</pool_size><command_termination_timeout>0</command_termination_timeout>" "pipe_udf.py --first-row-only --no-newline --close-stdout --linger"
     pipe_function pipe_pool_short_answer executable_pool \
-        "<pool_size>1</pool_size><command_termination_timeout>20</command_termination_timeout>" pipe_pool_short_answer.py
+        "<pool_size>1</pool_size><command_termination_timeout>20</command_termination_timeout>" "pipe_udf.py --first-row-only --close-stdout --read-to-eof"
     pipe_function pipe_pool_close_stdout_wait_stdin executable_pool \
-        "<pool_size>1</pool_size><command_termination_timeout>20</command_termination_timeout>" pipe_pool_answer_close_stdout_wait_stdin.py
+        "<pool_size>1</pool_size><command_termination_timeout>20</command_termination_timeout>" "pipe_udf.py --first-row-only --close-stdout --read-to-eof"
 } | shm_functions
 
 echo "--- stderr written on the way out fails the query, with or without the exit check"
@@ -77,7 +77,7 @@ echo "--- a stray line on stdout after the rows does not hide the stderr after i
 shm_local "
     SELECT pipe_stray_stdout_then_stderr(1);
 "
-shm_output_contains "late complaint"
+shm_output_contains "complaining on the way out"
 
 echo "--- with no grace and no exit check, a lingering command is not waited for"
 shm_local "

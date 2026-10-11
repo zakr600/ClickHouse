@@ -156,6 +156,7 @@ void ShellCommand::discardWithoutGrace() noexcept
 
 ShellCommand::~ShellCommand()
 {
+    /// `setDoNotTerminate`: nothing is done to the child, its group included.
     if (do_not_terminate)
         return;
 
@@ -167,67 +168,84 @@ ShellCommand::~ShellCommand()
             killAndReapNoThrow(/*whole_group=*/ true);
     });
 
+    /// Reaped already, or a bounded wait ran out with the child alive: nothing but the end of its
+    /// own group, above.
     if (wait_called)
         return;
 
-    if (config.terminate_in_destructor_strategy.terminate_in_destructor)
+    /// No `terminate_in_destructor`: waited for without a bound.
+    if (!config.terminate_in_destructor_strategy.terminate_in_destructor)
     {
-        /// Draw from the shared deadline: the cleanup-side wait may have already spent
-        /// most of `command_termination_timeout`, so this wait gets only what remains and
-        /// the configured grace period is honored once, not doubled.
-        bool process_terminated_normally = tryWaitProcessWithTimeout(remainingTerminationTimeoutMs());
-
-        if (process_terminated_normally)
-            return;
-
-        /// The whole group gets `SIGKILL` on the way out instead (see above).
-        if (config.own_process_group)
-            return;
-
-        /// A discarded command that has not exited within its grace period is killed, and reaped,
-        /// so that it leaves no zombie behind - and no entry in the registry of UDF processes.
-        /// `termination_signal` is for a command whose exit might still matter.
-        if (reap_on_destruction)
-        {
-            killAndReapNoThrow(/*whole_group=*/ false);
-            return;
-        }
-
-        LOG_TRACE(getLogger(), "Will kill shell command pid {} with signal {}", pid, config.terminate_in_destructor_strategy.termination_signal);
-
-        int retcode = kill(pid, config.terminate_in_destructor_strategy.termination_signal);
-        if (retcode != 0)
-        {
-            LOG_WARNING(getLogger(), "Cannot kill shell command pid {}, error: '{}'", pid, errnoToString());
-            return;
-        }
-
-        /// Reaped once it goes on the signal, as a command normally does - left alone, it would stay
-        /// a zombie for as long as the server runs - but not waited for here: a command can take its
-        /// time over the signal, and whatever destroys this (a query, a reload of a whole pool) is
-        /// not to be held up by it. A command that ignores the signal is left running, as it always
-        /// was.
-        try
-        {
-            const pid_t signalled_pid = pid;
-            forgetChild();
-            ShellCommandsHolder::instance().addSignalledChild(signalled_pid);
-        }
-        catch (...)
-        {
-            tryLogCurrentException(getLogger());
-        }
+        tryWaitNoThrow();
+        return;
     }
-    else
+
+    /// Given the grace period to exit on its own.
+    if (waitForExitWithinGracePeriod())
+        return;
+
+    /// With a group of its own, the whole group gets `SIGKILL` on the way out (above) instead of
+    /// `termination_signal`.
+    if (config.own_process_group)
+        return;
+
+    /// A discarded command is killed, and reaped, so that it leaves no zombie behind - and no
+    /// entry in the registry of UDF processes. `termination_signal` is for a command whose exit
+    /// might still matter.
+    if (reap_on_destruction)
     {
-        try
-        {
-            tryWait();
-        }
-        catch (...)
-        {
-            tryLogCurrentException(getLogger());
-        }
+        killAndReapNoThrow(/*whole_group=*/ false);
+        return;
+    }
+
+    signalAndHandOverChild();
+}
+
+bool ShellCommand::waitForExitWithinGracePeriod()
+{
+    /// Draw from the shared deadline: the cleanup-side wait may have already spent
+    /// most of `command_termination_timeout`, so this wait gets only what remains and
+    /// the configured grace period is honored once, not doubled.
+    return tryWaitProcessWithTimeout(remainingTerminationTimeoutMs());
+}
+
+void ShellCommand::signalAndHandOverChild()
+{
+    LOG_TRACE(getLogger(), "Will kill shell command pid {} with signal {}", pid, config.terminate_in_destructor_strategy.termination_signal);
+
+    int retcode = kill(pid, config.terminate_in_destructor_strategy.termination_signal);
+    if (retcode != 0)
+    {
+        LOG_WARNING(getLogger(), "Cannot kill shell command pid {}, error: '{}'", pid, errnoToString());
+        return;
+    }
+
+    /// Reaped once it goes on the signal, as a command normally does - left alone, it would stay
+    /// a zombie for as long as the server runs - but not waited for here: a command can take its
+    /// time over the signal, and whatever destroys this (a query, a reload of a whole pool) is
+    /// not to be held up by it. A command that ignores the signal is left running, as it always
+    /// was.
+    try
+    {
+        const pid_t signalled_pid = pid;
+        forgetChild();
+        ShellCommandsHolder::instance().addSignalledChild(signalled_pid);
+    }
+    catch (...)
+    {
+        tryLogCurrentException(getLogger());
+    }
+}
+
+void ShellCommand::tryWaitNoThrow() noexcept
+{
+    try
+    {
+        tryWait();
+    }
+    catch (...)
+    {
+        tryLogCurrentException(getLogger());
     }
 }
 
@@ -353,13 +371,50 @@ void ShellCommand::logCommand(const char * filename, char * const argv[])
     LOG_TRACE(ShellCommand::getLogger(), "Will start shell command '{}' with arguments {}", filename, args.str());
 }
 
-std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
-    const char * filename,
-    char * const argv[],
-    const Config & config)
+namespace
 {
-    logCommand(filename, argv);
-    ProfileEvents::increment(ProfileEvents::ExecuteShellCommand);
+
+/// The pipes a command is started with: those of its standard streams, and one for each of
+/// `Config::read_fds` and `Config::write_fds`, enlarged to `Config::pipe_capacity` if it is set.
+struct CommandPipes
+{
+    explicit CommandPipes(const ShellCommand::Config & config)
+    {
+        read_pipe_fds.reserve(config.read_fds.size());
+        write_pipe_fds.reserve(config.write_fds.size());
+
+        for (size_t i = 0; i < config.read_fds.size(); ++i)
+            read_pipe_fds.emplace_back(std::make_unique<PipeFDs>());
+
+        for (size_t i = 0; i < config.write_fds.size(); ++i)
+            write_pipe_fds.emplace_back(std::make_unique<PipeFDs>());
+
+        if (config.pipe_capacity)
+        {
+            if (config.pipe_capacity > static_cast<size_t>(std::numeric_limits<int>::max()))
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Pipe capacity {} exceeds maximum supported value {}",
+                    config.pipe_capacity,
+                    std::numeric_limits<int>::max());
+
+            int pipe_capacity = static_cast<int>(config.pipe_capacity);
+
+            pipe_stdin.tryIncreaseSize(pipe_capacity);
+
+            if (!config.pipe_stdin_only)
+            {
+                pipe_stdout.tryIncreaseSize(pipe_capacity);
+                pipe_stderr.tryIncreaseSize(pipe_capacity);
+            }
+
+            for (const auto & fds : read_pipe_fds)
+                fds->tryIncreaseSize(pipe_capacity);
+
+            for (const auto & fds : write_pipe_fds)
+                fds->tryIncreaseSize(pipe_capacity);
+        }
+    }
 
     PipeFDs pipe_stdin;
     PipeFDs pipe_stdout;
@@ -367,63 +422,41 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
 
     std::vector<std::unique_ptr<PipeFDs>> read_pipe_fds;
     std::vector<std::unique_ptr<PipeFDs>> write_pipe_fds;
+};
 
-    read_pipe_fds.reserve(config.read_fds.size());
-    write_pipe_fds.reserve(config.write_fds.size());
+/// Every descriptor the child installs - the ends of the standard-stream pipes, of the
+/// `read_fds`/`write_fds` pipes, and the inherited descriptors - is handed over in two steps,
+/// and the first one happens before `vfork`, where it is allowed to fail with an exception
+/// (`planHandovers`, `stageHandovers`). A plain `dup2(parent_fd, child_fd)` in the child is
+/// wrong in two ways that nobody can rule out, because the parent's numbers are whatever `pipe`
+/// and the caller got: when `parent_fd == child_fd` (the region's `memfd` happened to be
+/// created as 3, or the pipe end for `read_fds` `{7}` got 7) `dup2` is a no-op and the
+/// descriptor keeps its close-on-exec flag, so `exec` closes it; and when one hand-over's target
+/// is another's source (`{3 <- 4}, {4 <- 3}`, or a pipe target that is the number of the next
+/// pipe's end) the first `dup2` overwrites what the second was going to copy. So every source is
+/// first duplicated to a number above every target, and the child `dup2`s from those copies,
+/// which can neither be a target nor be clobbered by one. The copies are close-on-exec: they must
+/// not outlive this `exec` in any child, and they are closed in the parent once the child has run.
+struct Handover
+{
+    int child_fd;
+    int parent_fd;
+    ChildSetupStep step;
+};
 
-    for (size_t i = 0; i < config.read_fds.size(); ++i)
-        read_pipe_fds.emplace_back(std::make_unique<PipeFDs>());
-
-    for (size_t i = 0; i < config.write_fds.size(); ++i)
-        write_pipe_fds.emplace_back(std::make_unique<PipeFDs>());
-
-    if (config.pipe_capacity)
-    {
-        if (config.pipe_capacity > static_cast<size_t>(std::numeric_limits<int>::max()))
-            throw Exception(
-                ErrorCodes::BAD_ARGUMENTS,
-                "Pipe capacity {} exceeds maximum supported value {}",
-                config.pipe_capacity,
-                std::numeric_limits<int>::max());
-
-        int pipe_capacity = static_cast<int>(config.pipe_capacity);
-
-        pipe_stdin.tryIncreaseSize(pipe_capacity);
-
-        if (!config.pipe_stdin_only)
-        {
-            pipe_stdout.tryIncreaseSize(pipe_capacity);
-            pipe_stderr.tryIncreaseSize(pipe_capacity);
-        }
-
-        for (const auto & fds : read_pipe_fds)
-            fds->tryIncreaseSize(pipe_capacity);
-
-        for (const auto & fds : write_pipe_fds)
-            fds->tryIncreaseSize(pipe_capacity);
-    }
-
-    /// Every descriptor the child installs - the ends of the standard-stream pipes, of the
-    /// `read_fds`/`write_fds` pipes, and the inherited descriptors - is handed over in two steps,
-    /// and the first one happens here, before `vfork`, where it is allowed to fail with an
-    /// exception. A plain `dup2(parent_fd, child_fd)` in the child is wrong in two ways that
-    /// nobody can rule out, because the parent's numbers are whatever `pipe` and the caller got:
-    /// when `parent_fd == child_fd` (the region's `memfd` happened to be created as 3, or the
-    /// pipe end for `read_fds` `{7}` got 7) `dup2` is a no-op and the descriptor keeps its
-    /// close-on-exec flag, so `exec` closes it; and when one hand-over's target is another's
-    /// source (`{3 <- 4}, {4 <- 3}`, or a pipe target that is the number of the next pipe's end)
-    /// the first `dup2` overwrites what the second was going to copy. So every source is first
-    /// duplicated to a number above every target, and the child `dup2`s from those copies, which
-    /// can neither be a target nor be clobbered by one. The copies are close-on-exec: they must
-    /// not outlive this `exec` in any child, and they are closed in the parent once the child
-    /// has run.
-    struct Handover
-    {
-        int child_fd;
-        int parent_fd;
-        ChildSetupStep step;
-    };
+struct HandoverPlan
+{
     std::vector<Handover> handovers;
+
+    /// The first number above every descriptor the child is going to install something under.
+    int first_free_fd = 0;
+};
+
+/// Lists every hand-over to the child and checks that the targets can be installed as they are.
+HandoverPlan planHandovers(const ShellCommand::Config & config, const CommandPipes & pipes)
+{
+    HandoverPlan plan;
+    auto & handovers = plan.handovers;
     handovers.reserve(3 + config.read_fds.size() + config.write_fds.size() + config.inherited_fds.size());
 
     /// Every number the child is going to install something under, each claimed once. The
@@ -433,16 +466,16 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
     /// parent goes on reading from, say, with the region's descriptor sitting where the child
     /// was told to write into it. Refused here, where it is a configuration error with a
     /// message, rather than found in the child.
-    handovers.push_back({STDIN_FILENO, pipe_stdin.fds_rw[0], ChildSetupStep::DUP_STDIN});
+    handovers.push_back({STDIN_FILENO, pipes.pipe_stdin.fds_rw[0], ChildSetupStep::DUP_STDIN});
     if (!config.pipe_stdin_only)
     {
-        handovers.push_back({STDOUT_FILENO, pipe_stdout.fds_rw[1], ChildSetupStep::DUP_STDOUT});
-        handovers.push_back({STDERR_FILENO, pipe_stderr.fds_rw[1], ChildSetupStep::DUP_STDERR});
+        handovers.push_back({STDOUT_FILENO, pipes.pipe_stdout.fds_rw[1], ChildSetupStep::DUP_STDOUT});
+        handovers.push_back({STDERR_FILENO, pipes.pipe_stderr.fds_rw[1], ChildSetupStep::DUP_STDERR});
     }
     for (size_t i = 0; i < config.read_fds.size(); ++i)
-        handovers.push_back({config.read_fds[i], read_pipe_fds[i]->fds_rw[1], ChildSetupStep::DUP_READ_DESCRIPTOR});
+        handovers.push_back({config.read_fds[i], pipes.read_pipe_fds[i]->fds_rw[1], ChildSetupStep::DUP_READ_DESCRIPTOR});
     for (size_t i = 0; i < config.write_fds.size(); ++i)
-        handovers.push_back({config.write_fds[i], write_pipe_fds[i]->fds_rw[0], ChildSetupStep::DUP_WRITE_DESCRIPTOR});
+        handovers.push_back({config.write_fds[i], pipes.write_pipe_fds[i]->fds_rw[0], ChildSetupStep::DUP_WRITE_DESCRIPTOR});
     for (const auto & [child_fd, parent_fd] : config.inherited_fds)
         handovers.push_back({child_fd, parent_fd, ChildSetupStep::DUP_INHERITED_DESCRIPTOR});
 
@@ -464,30 +497,136 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
             "Descriptor {} is claimed more than once in the child (by a standard stream, read_fds, write_fds or "
             "inherited_fds)", *duplicate);
 
-    /// The first number above every descriptor the child is going to install something under.
     if (child_targets.back() == std::numeric_limits<int>::max())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Descriptor {} cannot be a target in the child: there is no number above it", child_targets.back());
-    const int first_free_fd = child_targets.back() + 1;
+    plan.first_free_fd = child_targets.back() + 1;
+
+    return plan;
+}
+
+/// The first step of every hand-over (see `Handover`): its source is duplicated, close-on-exec, to
+/// a number above every target, and the copy is appended to `staged_fds`, in the order of
+/// `plan.handovers`. The caller closes everything in `staged_fds`, including when this throws
+/// halfway.
+void stageHandovers(const HandoverPlan & plan, std::vector<int> & staged_fds)
+{
+    for (const auto & handover : plan.handovers)
+    {
+        int staged = ::fcntl(handover.parent_fd, F_DUPFD_CLOEXEC, plan.first_free_fd);
+        if (staged == -1)
+            throw ErrnoException(ErrorCodes::CANNOT_FCNTL, "Cannot duplicate descriptor {} to hand it to a child as {}", handover.parent_fd, handover.child_fd);
+        staged_fds.push_back(staged);
+    }
+}
+
+/// Runs in the child, between `vfork` and `exec`: whether the original of the `i`-th of
+/// `Config::inherited_fds` is to be left open rather than closed (see `execChild`).
+bool leaveInheritedOriginalOpen(const ShellCommand::Config & config, size_t i)
+{
+    const int parent_fd = config.inherited_fds[i].second;
+    bool leave_alone = parent_fd <= STDERR_FILENO;
+    for (int fd : config.read_fds)
+        leave_alone |= parent_fd == fd;
+    for (int fd : config.write_fds)
+        leave_alone |= parent_fd == fd;
+    for (const auto & [other_child_fd, other_parent_fd] : config.inherited_fds)
+        leave_alone |= parent_fd == other_child_fd;
+    for (size_t j = 0; j < i; ++j)
+        leave_alone |= parent_fd == config.inherited_fds[j].second;
+    return leave_alone;
+}
+
+/// The child, between `vfork` and `exec`: installs the descriptors and `exec`s the command, or
+/// reports the step that failed into `child_error_fd` and exits. It runs on the parent's memory,
+/// so it makes only async-signal-safe calls, and allocates, throws, locks and logs nothing:
+/// everything it needs was prepared before `vfork`.
+[[noreturn]] void execChild(
+    const char * filename,
+    char * const argv[],
+    const ShellCommand::Config & config,
+    const std::vector<Handover> & handovers,
+    const std::vector<int> & staged_fds,
+    int child_error_fd)
+{
+    /// NOLINTBEGIN(clang-analyzer-unix.Vfork)
+
+    /// Why `_exit` and not `exit`? Because `exit` calls `atexit` and destructors of thread local storage.
+    /// And there is a lot of garbage (including, for example, mutex is blocked). And this can not be done after `vfork` - deadlock happens.
+
+    /// Install every descriptor under the number the child expects, `dup2`ing from the staged
+    /// copy (see `Handover`). The staged copy is above every target, so this is never a no-op and
+    /// never destroys a source. The result has no close-on-exec flag, so it survives the `exec`
+    /// below; the staged copy does not, and neither do the pipe ends themselves.
+    for (size_t i = 0; i < handovers.size(); ++i)
+        if (handovers[i].child_fd != dup2(staged_fds[i], handovers[i].child_fd))
+            reportChildSetupFailureAndExit(child_error_fd, handovers[i].step);
+
+    /// The originals must not reach the child either, under their own numbers: the contract
+    /// is "this descriptor, under the number it is told", and an original that is not
+    /// close-on-exec would otherwise survive the `exec` as a second copy - for a pipe, an
+    /// extra reader or writer that keeps the parent from ever seeing EOF. Closed here rather
+    /// than required to be close-on-exec, so that the contract does not depend on how the
+    /// caller opened the descriptor. An original whose number is itself a target - of any of
+    /// the `dup2`s above: the standard streams, `read_fds`, `write_fds` or another inherited
+    /// pair - has just been overwritten with the right thing and is left alone; closing it
+    /// would take down what was just installed there. And an original handed over under two
+    /// numbers (`{10 <- 5}, {11 <- 5}`) is one descriptor, closed once: the second close would
+    /// fail on a number that is already free, or worse, hit whatever got that number since.
+    for (size_t i = 0; i < config.inherited_fds.size(); ++i)
+    {
+        if (!leaveInheritedOriginalOpen(config, i) && 0 != ::close(config.inherited_fds[i].second))
+            reportChildSetupFailureAndExit(child_error_fd, ChildSetupStep::CLOSE_INHERITED_DESCRIPTOR);
+    }
+
+    // Reset the signal mask: it may be non-empty and will be inherited
+    // by the child process, which might not expect this.
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigprocmask(0, nullptr, &mask); // NOLINT(concurrency-mt-unsafe)
+    sigprocmask(SIG_UNBLOCK, &mask, nullptr); // NOLINT(concurrency-mt-unsafe)
+
+    /// A group of its own, led by this process, so that the destructor can end it together
+    /// with whatever it starts (see `Config::own_process_group`). In the child, before `exec`:
+    /// by the time `vfork` returns in the parent the group already exists, so the parent can
+    /// never signal a group that is not there yet.
+    if (config.own_process_group && 0 != ::setpgid(0, 0))
+        reportChildSetupFailureAndExit(child_error_fd, ChildSetupStep::SET_PROCESS_GROUP);
+
+    execv(filename, argv);
+    /// If the process is running, then `execv` does not return here.
+
+    reportChildSetupFailureAndExit(child_error_fd, ChildSetupStep::EXEC);
+    /// NOLINTEND(clang-analyzer-unix.Vfork)
+}
+
+}
+
+std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
+    const char * filename,
+    char * const argv[],
+    const Config & config)
+{
+    logCommand(filename, argv);
+    ProfileEvents::increment(ProfileEvents::ExecuteShellCommand);
+
+    CommandPipes pipes(config);
+
+    /// Before `vfork`, everything the child is going to need, and that may fail with an exception.
+    const HandoverPlan plan = planHandovers(config, pipes);
 
     std::vector<int> staged_fds;
-    staged_fds.reserve(handovers.size() + 1);
+    staged_fds.reserve(plan.handovers.size() + 1);
     SCOPE_EXIT({
         for (int fd : staged_fds)
             if (0 != ::close(fd))
                 LOG_WARNING(getLogger(), "Cannot close a staged descriptor: {}", errnoToString());
     });
-    for (const auto & handover : handovers)
-    {
-        int staged = ::fcntl(handover.parent_fd, F_DUPFD_CLOEXEC, first_free_fd);
-        if (staged == -1)
-            throw ErrnoException(ErrorCodes::CANNOT_FCNTL, "Cannot duplicate descriptor {} to hand it to a child as {}", handover.parent_fd, handover.child_fd);
-        staged_fds.push_back(staged);
-    }
+    stageHandovers(plan, staged_fds);
 
-    /// How the child reports a failure of any step below: a close-on-exec pipe. A successful
-    /// `exec` leaves no report; a failure writes the step and the
+    /// How the child reports a failure of any step of its preparation: a close-on-exec pipe. A
+    /// successful `exec` leaves no report; a failure writes the step and the
     /// `errno` and the parent reads those. The child's copy of the write end is staged above every
-    /// target like the descriptors above are, so that no `dup2` below lands on it - it would
+    /// target like the descriptors above are, so that no `dup2` in the child lands on it - it would
     /// otherwise be silently replaced by whatever was installed under that number, and a later
     /// failure would write its report into a pipe or a region instead. (The pipe itself is opened
     /// with `O_CLOEXEC`, and `F_DUPFD_CLOEXEC` keeps the copy so.) Both of the parent's write ends
@@ -497,7 +636,7 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
     /// After `vfork` the report is already available or the child has executed successfully;
     /// receiving it must not depend on every unrelated copy of the writer being closed.
     pipe_child_error.setNonBlockingRead();
-    const int child_error_fd = ::fcntl(pipe_child_error.fds_rw[1], F_DUPFD_CLOEXEC, first_free_fd);
+    const int child_error_fd = ::fcntl(pipe_child_error.fds_rw[1], F_DUPFD_CLOEXEC, plan.first_free_fd);
     if (child_error_fd == -1)
         throw ErrnoException(ErrorCodes::CANNOT_FCNTL, "Cannot duplicate the child error pipe");
     staged_fds.push_back(child_error_fd);
@@ -505,21 +644,22 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
     /// `vfork` must be called directly, not through a pointer obtained with `dlsym`: the compiler
     /// knows `vfork` as a function that returns twice, and only a call it can see as such makes
     /// it keep the stack slots of this frame intact across the child's execution. The child runs
-    /// the block below on this very frame, and the codegen treats that block as one that never
+    /// `execChild` from this very frame, and the codegen treats that call as one that never
     /// comes back (it ends with `_exit`), so without the attribute it happily reuses the spill
-    /// slot of a value the block no longer needs - the `config` reference, say - for one of its
+    /// slot of a value the call no longer needs - the `config` reference, say - for one of its
     /// own temporaries. The child then `exec`s, the parent wakes up, and reads garbage from its
     /// own frame. This is not a theoretical concern: the MemorySanitizer build did exactly that
-    /// in the loop over `inherited_fds` below.
+    /// in the loop over `inherited_fds` (now in `execChild`), back when the child's code was
+    /// inline here.
     ///
     /// The pointer from `dlsym` also hid the call from the static analyzer, which has two things
     /// to say about `vfork`. That `posix_spawn` is the safer API: it is, and moving this code to
     /// it is a change of its own; until then this is the one place in the server that spawns,
     /// and it is written with the care `vfork` demands. And that nothing but `exec`/`_exit` may
-    /// be called after it: the child below makes only the calls `posix_spawn` itself makes in its
-    /// own child - `dup2`, `close`, `sigprocmask`, all async-signal-safe - and touches nothing
-    /// the parent shares beyond the descriptor table, which is the child's own. Suppressed, not
-    /// hidden.
+    /// be called after it: the child (`execChild`) makes only the calls `posix_spawn` itself makes
+    /// in its own child - `dup2`, `close`, `sigprocmask`, all async-signal-safe - besides its own
+    /// helpers, which allocate nothing, and touches nothing the parent shares beyond the
+    /// descriptor table, which is the child's own. Suppressed, not hidden.
     pid_t pid = vfork(); // NOLINT(bugprone-unsafe-functions,cert-msc24-c,cert-msc33-c,clang-analyzer-security.insecureAPI.vfork)
 
     if (pid == -1)
@@ -529,63 +669,7 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
     {
         /// We are in the freshly created process.
         /// NOLINTBEGIN(clang-analyzer-unix.Vfork)
-
-        /// Why `_exit` and not `exit`? Because `exit` calls `atexit` and destructors of thread local storage.
-        /// And there is a lot of garbage (including, for example, mutex is blocked). And this can not be done after `vfork` - deadlock happens.
-
-        /// Install every descriptor under the number the child expects, `dup2`ing from the staged
-        /// copy (see above). The staged copy is above every target, so this is never a no-op and
-        /// never destroys a source. The result has no close-on-exec flag, so it survives the `exec`
-        /// below; the staged copy does not, and neither do the pipe ends themselves.
-        for (size_t i = 0; i < handovers.size(); ++i)
-            if (handovers[i].child_fd != dup2(staged_fds[i], handovers[i].child_fd))
-                reportChildSetupFailureAndExit(child_error_fd, handovers[i].step);
-
-        /// The originals must not reach the child either, under their own numbers: the contract
-        /// is "this descriptor, under the number it is told", and an original that is not
-        /// close-on-exec would otherwise survive the `exec` as a second copy - for a pipe, an
-        /// extra reader or writer that keeps the parent from ever seeing EOF. Closed here rather
-        /// than required to be close-on-exec, so that the contract does not depend on how the
-        /// caller opened the descriptor. An original whose number is itself a target - of any of
-        /// the `dup2`s above: the standard streams, `read_fds`, `write_fds` or another inherited
-        /// pair - has just been overwritten with the right thing and is left alone; closing it
-        /// would take down what was just installed there. And an original handed over under two
-        /// numbers (`{10 <- 5}, {11 <- 5}`) is one descriptor, closed once: the second close would
-        /// fail on a number that is already free, or worse, hit whatever got that number since.
-        for (size_t i = 0; i < config.inherited_fds.size(); ++i)
-        {
-            const int parent_fd = config.inherited_fds[i].second;
-            bool leave_alone = parent_fd <= STDERR_FILENO;
-            for (int fd : config.read_fds)
-                leave_alone |= parent_fd == fd;
-            for (int fd : config.write_fds)
-                leave_alone |= parent_fd == fd;
-            for (const auto & [other_child_fd, other_parent_fd] : config.inherited_fds)
-                leave_alone |= parent_fd == other_child_fd;
-            for (size_t j = 0; j < i; ++j)
-                leave_alone |= parent_fd == config.inherited_fds[j].second;
-            if (!leave_alone && 0 != ::close(parent_fd))
-                reportChildSetupFailureAndExit(child_error_fd, ChildSetupStep::CLOSE_INHERITED_DESCRIPTOR);
-        }
-
-        // Reset the signal mask: it may be non-empty and will be inherited
-        // by the child process, which might not expect this.
-        sigset_t mask;
-        sigemptyset(&mask);
-        sigprocmask(0, nullptr, &mask); // NOLINT(concurrency-mt-unsafe)
-        sigprocmask(SIG_UNBLOCK, &mask, nullptr); // NOLINT(concurrency-mt-unsafe)
-
-        /// A group of its own, led by this process, so that the destructor can end it together
-        /// with whatever it starts (see `Config::own_process_group`). In the child, before `exec`:
-        /// by the time `vfork` returns in the parent the group already exists, so the parent can
-        /// never signal a group that is not there yet.
-        if (config.own_process_group && 0 != ::setpgid(0, 0))
-            reportChildSetupFailureAndExit(child_error_fd, ChildSetupStep::SET_PROCESS_GROUP);
-
-        execv(filename, argv);
-        /// If the process is running, then `execv` does not return here.
-
-        reportChildSetupFailureAndExit(child_error_fd, ChildSetupStep::EXEC);
+        execChild(filename, argv, config, plan.handovers, staged_fds, child_error_fd);
         /// NOLINTEND(clang-analyzer-unix.Vfork)
     }
 
@@ -597,128 +681,21 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
     if (config.own_process_group && 0 != ::setpgid(pid, pid) && errno != EACCES && errno != ESRCH)
         LOG_WARNING(getLogger(), "Cannot put shell command pid {} into a process group of its own: {}", pid, errnoToString());
 
-    /// The child has either `exec`ed or written its report and exited (that is what `vfork`
-    /// guarantees by the time it returns in the parent). Read the report without waiting for EOF:
-    /// another process may still hold a copy of the write end.
-    {
-        if (0 != ::close(child_error_fd))
-            LOG_WARNING(getLogger(), "Cannot close the child error pipe: {}", errnoToString());
-        staged_fds.pop_back();
-        if (0 != ::close(pipe_child_error.fds_rw[1]))
-            LOG_WARNING(getLogger(), "Cannot close the child error pipe: {}", errnoToString());
-        pipe_child_error.fds_rw[1] = -1;
+    /// Both of the parent's write ends of the error pipe are closed before its report is read.
+    if (0 != ::close(child_error_fd))
+        LOG_WARNING(getLogger(), "Cannot close the child error pipe: {}", errnoToString());
+    staged_fds.pop_back();
+    if (0 != ::close(pipe_child_error.fds_rw[1]))
+        LOG_WARNING(getLogger(), "Cannot close the child error pipe: {}", errnoToString());
+    pipe_child_error.fds_rw[1] = -1;
 
-#if defined(THREAD_SANITIZER)
-        /// ThreadSanitizer intercepts `vfork` and calls `fork` instead, so here the parent can resume
-        /// before the child has got to `exec`, and a read without waiting would take a child that is
-        /// about to fail for one that started. Wait for its report or for the end of the pipe: the
-        /// write end is close-on-exec, so it goes at `exec` or at exit - in this child, and in any
-        /// other one spawned meanwhile that inherited it.
-        ///
-        /// Bounded all the same: a child spawned meanwhile by another thread that inherited the write
-        /// end and stalls before its own `exec` must not hang this one. Past the bound the report
-        /// is read as in any other build, without waiting.
-        {
-            static constexpr UInt64 child_report_wait_ms = 10000;
-            const UInt64 deadline_ns = monotonicDeadlineNs(child_report_wait_ms);
-            pollfd pfd{};
-            pfd.fd = pipe_child_error.fds_rw[0];
-            pfd.events = POLLIN;
-            while (true)
-            {
-                const UInt64 remaining_ms = millisecondsUntil(deadline_ns);
-                const int res = remaining_ms == 0 ? 0 : ::poll(&pfd, 1, static_cast<int>(remaining_ms));
-                if (res < 0 && errno == EINTR)
-                    continue;
-                if (res == 0)
-                    LOG_WARNING(
-                        getLogger(), "The child error pipe of pid {} neither reported nor closed within {} ms", pid, child_report_wait_ms);
-                break;
-            }
-        }
-#endif
-
-        ChildSetupFailure failure{};
-        ssize_t bytes_read = 0;
-        do
-            bytes_read = ::read(pipe_child_error.fds_rw[0], &failure, sizeof(failure));
-        while (bytes_read == -1 && errno == EINTR);
-
-        /// A read that failed for any other reason says nothing about the child. What does is
-        /// `waitpid`: by the time `vfork` returned, the child had either `exec`ed - and is running
-        /// - or written its report and exited - and is a zombie - so a non-blocking probe answers
-        /// without the risk of blocking on a child that is alive and well, which a pool worker
-        /// would be for as long as it is not asked to exit.
-        bool child_reported_failure = bytes_read > 0;
-        if (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
-        {
-            const int read_error = errno;
-            int status = 0;
-            pid_t probed = 0;
-            do
-                probed = ::waitpid(pid, &status, WNOHANG);
-            while (probed == -1 && errno == EINTR);
-
-            if (probed == 0)
-                LOG_WARNING(getLogger(), "Cannot read the child error pipe of pid {} ({}); the child is running, so it has started", pid, errnoToString(read_error));
-            else if (probed == pid)
-                throw Exception(
-                    ErrorCodes::CANNOT_CREATE_CHILD_PROCESS,
-                    "Cannot prepare child process: it exited before exec, and its report could not be read: {}",
-                    errnoToString(read_error));
-            else
-            {
-                /// The probe itself failed, so nothing here says what the child did - it is not a
-                /// child that exited, it is a child nothing is known about. This call fails either
-                /// way, and that is what makes the difference matter: no `ShellCommand` is
-                /// constructed, so a child that did `exec` would be left with nobody to wait for
-                /// it, nobody to signal it and no entry in the registry of UDF processes - a
-                /// command running as the server's user for as long as it pleases. So it is
-                /// signalled and reaped before the failure is reported. `ESRCH` on a child that
-                /// was gone after all costs nothing, and this is the one place where killing is
-                /// the conservative choice: the alternative is leaking the process.
-                const int probe_error = errno;
-
-                if (0 != ::kill(pid, SIGKILL) && errno != ESRCH)
-                    LOG_WARNING(getLogger(), "Cannot kill child process pid {}: {}", pid, errnoToString());
-
-                while (-1 == ::waitpid(pid, &status, 0) && errno == EINTR)
-                {
-                }
-
-                throw Exception(
-                    ErrorCodes::CANNOT_CREATE_CHILD_PROCESS,
-                    "Cannot prepare child process: its report could not be read ({}) and whether it started could "
-                    "not be established ({}); it is signalled",
-                    errnoToString(read_error),
-                    errnoToString(probe_error));
-            }
-        }
-
-        if (child_reported_failure)
-        {
-            /// The child is gone; reap it so that it does not linger as a zombie, then report.
-            int status = 0;
-            while (-1 == ::waitpid(pid, &status, 0) && errno == EINTR)
-            {
-            }
-
-            if (bytes_read == sizeof(failure))
-                throw Exception(
-                    ErrorCodes::CANNOT_CREATE_CHILD_PROCESS,
-                    "Cannot {} in child process: {}",
-                    describe(static_cast<ChildSetupStep>(failure.step)),
-                    errnoToString(failure.error));
-
-            throw Exception(ErrorCodes::CANNOT_CREATE_CHILD_PROCESS, "Cannot prepare child process: incomplete report from it");
-        }
-    }
+    checkChildSetupReport(pid, pipe_child_error.fds_rw[0]);
 
     std::unique_ptr<ShellCommand> res(new ShellCommand(
         pid,
-        pipe_stdin.fds_rw[1],
-        pipe_stdout.fds_rw[0],
-        pipe_stderr.fds_rw[0],
+        pipes.pipe_stdin.fds_rw[1],
+        pipes.pipe_stdout.fds_rw[0],
+        pipes.pipe_stderr.fds_rw[0],
         config));
 
     if (config.register_in_udf_process_registry)
@@ -726,14 +703,14 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
 
     for (size_t i = 0; i < config.read_fds.size(); ++i)
     {
-        auto & fds = *read_pipe_fds[i];
+        auto & fds = *pipes.read_pipe_fds[i];
         auto fd = config.read_fds[i];
         res->read_fds.emplace(fd, fds.fds_rw[0]);
     }
 
     for (size_t i = 0; i < config.write_fds.size(); ++i)
     {
-        auto & fds = *write_pipe_fds[i];
+        auto & fds = *pipes.write_pipe_fds[i];
         auto fd = config.write_fds[i];
         res->write_fds.emplace(fd, fds.fds_rw[1]);
     }
@@ -747,6 +724,120 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
         res->err.getFD());
 
     return res;
+}
+
+void ShellCommand::checkChildSetupReport(pid_t child_pid, int report_fd)
+{
+    /// The child has either `exec`ed or written its report and exited (that is what `vfork`
+    /// guarantees by the time it returns in the parent). Read the report without waiting for EOF:
+    /// another process may still hold a copy of the write end.
+
+#if defined(THREAD_SANITIZER)
+    /// ThreadSanitizer intercepts `vfork` and calls `fork` instead, so here the parent can resume
+    /// before the child has got to `exec`, and a read without waiting would take a child that is
+    /// about to fail for one that started. Wait for its report or for the end of the pipe: the
+    /// write end is close-on-exec, so it goes at `exec` or at exit - in this child, and in any
+    /// other one spawned meanwhile that inherited it.
+    ///
+    /// Bounded all the same: a child spawned meanwhile by another thread that inherited the write
+    /// end and stalls before its own `exec` must not hang this one. Past the bound the report
+    /// is read as in any other build, without waiting.
+    {
+        static constexpr UInt64 child_report_wait_ms = 10000;
+        const UInt64 deadline_ns = monotonicDeadlineNs(child_report_wait_ms);
+        pollfd pfd{};
+        pfd.fd = report_fd;
+        pfd.events = POLLIN;
+        while (true)
+        {
+            const UInt64 remaining_ms = millisecondsUntil(deadline_ns);
+            const int res = remaining_ms == 0 ? 0 : ::poll(&pfd, 1, static_cast<int>(remaining_ms));
+            if (res < 0 && errno == EINTR)
+                continue;
+            if (res == 0)
+                LOG_WARNING(
+                    getLogger(), "The child error pipe of pid {} neither reported nor closed within {} ms", child_pid, child_report_wait_ms);
+            break;
+        }
+    }
+#endif
+
+    ChildSetupFailure failure{};
+    ssize_t bytes_read = 0;
+    do
+        bytes_read = ::read(report_fd, &failure, sizeof(failure));
+    while (bytes_read == -1 && errno == EINTR);
+
+    bool child_reported_failure = bytes_read > 0;
+    if (bytes_read < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+        handleUnreadableChildReport(child_pid, errno);
+
+    if (child_reported_failure)
+    {
+        /// The child is gone; reap it so that it does not linger as a zombie, then report.
+        int status = 0;
+        while (-1 == ::waitpid(child_pid, &status, 0) && errno == EINTR)
+        {
+        }
+
+        if (bytes_read == sizeof(failure))
+            throw Exception(
+                ErrorCodes::CANNOT_CREATE_CHILD_PROCESS,
+                "Cannot {} in child process: {}",
+                describe(static_cast<ChildSetupStep>(failure.step)),
+                errnoToString(failure.error));
+
+        throw Exception(ErrorCodes::CANNOT_CREATE_CHILD_PROCESS, "Cannot prepare child process: incomplete report from it");
+    }
+}
+
+void ShellCommand::handleUnreadableChildReport(pid_t child_pid, int read_error)
+{
+    /// A read that failed for any other reason than an empty pipe says nothing about the child.
+    /// What does is `waitpid`: by the time `vfork` returned, the child had either `exec`ed - and is
+    /// running - or written its report and exited - and is a zombie - so a non-blocking probe
+    /// answers without the risk of blocking on a child that is alive and well, which a pool worker
+    /// would be for as long as it is not asked to exit.
+    int status = 0;
+    pid_t probed = 0;
+    do
+        probed = ::waitpid(child_pid, &status, WNOHANG);
+    while (probed == -1 && errno == EINTR);
+
+    if (probed == 0)
+        LOG_WARNING(getLogger(), "Cannot read the child error pipe of pid {} ({}); the child is running, so it has started", child_pid, errnoToString(read_error));
+    else if (probed == child_pid)
+        throw Exception(
+            ErrorCodes::CANNOT_CREATE_CHILD_PROCESS,
+            "Cannot prepare child process: it exited before exec, and its report could not be read: {}",
+            errnoToString(read_error));
+    else
+    {
+        /// The probe itself failed, so nothing here says what the child did - it is not a
+        /// child that exited, it is a child nothing is known about. This call fails either
+        /// way, and that is what makes the difference matter: no `ShellCommand` is
+        /// constructed, so a child that did `exec` would be left with nobody to wait for
+        /// it, nobody to signal it and no entry in the registry of UDF processes - a
+        /// command running as the server's user for as long as it pleases. So it is
+        /// signalled and reaped before the failure is reported. `ESRCH` on a child that
+        /// was gone after all costs nothing, and this is the one place where killing is
+        /// the conservative choice: the alternative is leaking the process.
+        const int probe_error = errno;
+
+        if (0 != ::kill(child_pid, SIGKILL) && errno != ESRCH)
+            LOG_WARNING(getLogger(), "Cannot kill child process pid {}: {}", child_pid, errnoToString());
+
+        while (-1 == ::waitpid(child_pid, &status, 0) && errno == EINTR)
+        {
+        }
+
+        throw Exception(
+            ErrorCodes::CANNOT_CREATE_CHILD_PROCESS,
+            "Cannot prepare child process: its report could not be read ({}) and whether it started could "
+            "not be established ({}); it is signalled",
+            errnoToString(read_error),
+            errnoToString(probe_error));
+    }
 }
 
 
@@ -804,17 +895,18 @@ struct ShellCommand::tryWaitResult
 
 int ShellCommand::tryWait()
 {
-    return tryWaitImpl(true).retcode;
+    return tryWaitImpl({.blocking = true}).retcode;
 }
 
-ShellCommand::tryWaitResult ShellCommand::tryWaitImpl(bool blocking, bool check_exit_status, bool close_streams)
+ShellCommand::tryWaitResult ShellCommand::tryWaitImpl(const TryWaitOptions & options)
 {
+    const bool blocking = options.blocking;
     if (blocking)
         LOG_TRACE(getLogger(), "Will wait for shell command pid {}", pid);
 
     ShellCommand::tryWaitResult result;
 
-    int options = ((!blocking) ? WNOHANG : 0);
+    int waitpid_flags = ((!blocking) ? WNOHANG : 0);
     int status = 0;
     int waitpid_retcode = -1;
     ::rusage local_rusage{};
@@ -850,9 +942,9 @@ ShellCommand::tryWaitResult ShellCommand::tryWaitImpl(bool blocking, bool check_
         /// `rusage` out-parameter and shares its pid/status/options/EINTR semantics.
         /// Without the flag, reap with plain `waitpid` and collect no usage.
         if (config.collect_resource_usage)
-            waitpid_retcode = wait4(pid, &status, options, &local_rusage);
+            waitpid_retcode = wait4(pid, &status, waitpid_flags, &local_rusage);
         else
-            waitpid_retcode = waitpid(pid, &status, options);
+            waitpid_retcode = waitpid(pid, &status, waitpid_flags);
         if (waitpid_retcode > 0)
         {
             /// A reaped pid may be reused immediately, so `wait_called` must be set the
@@ -895,13 +987,13 @@ ShellCommand::tryWaitResult ShellCommand::tryWaitImpl(bool blocking, bool check_
 
     /// Deliberately optional: see the declaration. A caller that still has to read what the child
     /// left in its pipes closes them itself, afterwards.
-    if (close_streams)
+    if (options.close_streams)
         closeStreams();
 
     /// When `check_exit_status` is false the caller only wants the reaped `rusage`;
     /// skip decoding/validating the status so a non-zero or signalled child is not
     /// reported as an error.
-    if (!check_exit_status)
+    if (!options.check_exit_status)
         return result;
 
     if (WIFEXITED(status))
@@ -945,7 +1037,7 @@ void ShellCommand::handleProcessRetcode(int retcode) const
 
 bool ShellCommand::waitIfProccesTerminated()
 {
-    auto proc_status = tryWaitImpl(false);
+    auto proc_status = tryWaitImpl({.blocking = false});
     if (proc_status.is_process_terminated)
     {
         handleProcessRetcode(proc_status.retcode);
@@ -1043,7 +1135,7 @@ bool ShellCommand::tryWaitWithoutStatusCheck()
 
     while (true)
     {
-        if (tryWaitImpl(/*blocking=*/false, /*check_exit_status=*/false).is_process_terminated)
+        if (tryWaitImpl({.blocking = false, .check_exit_status = false}).is_process_terminated)
             return true;
 
         const UInt64 remaining_ms = remainingTerminationTimeoutMs();
@@ -1185,26 +1277,24 @@ void ShellCommand::drainOutputPipes(
 }
 
 
-bool ShellCommand::waitDrainingOutput(const WaitDrainingOptions & options)
+void ShellCommand::checkCancelled(const std::function<void()> & check_cancelled)
 {
-    const auto & stderr_sink = options.stderr_sink;
-    const bool check_exit_status = options.check_exit_status;
-    const bool unbounded_status_wait = options.unbounded_status_wait;
-    const bool limit_stdout_drain = options.limit_stdout_drain;
-    const auto & check_cancelled = options.check_cancelled;
+    if (!check_cancelled)
+        return;
 
-    LOG_TRACE(getLogger(), "Will wait for shell command pid {} while draining its output", pid);
-    /// A child that writes past what the protocol asked of it fills the pipe and blocks in `write`.
-    /// Nothing reads that pipe any more by the time this is called, so the only way the child ever
-    /// reaches its own exit is if the bytes keep being taken off the pipe here and thrown away.
-    static constexpr UInt64 poll_step_ms = 5;
+    try
+    {
+        check_cancelled();
+    }
+    catch (...)
+    {
+        endTerminationGracePeriod();
+        throw;
+    }
+}
 
-    /// The descriptors still worth draining, in the order they are polled. One that has hung up or
-    /// reached EOF is dropped out of the set (-1, which `poll` ignores): `poll` reports a hung-up
-    /// descriptor immediately and forever, so a child that closed its own output and then lingered
-    /// would otherwise spin a core here for the whole termination budget.
-    int drain_fds[2] = {out.getFD(), err.getFD()};
-
+bool ShellCommand::closeAbandonedStdout(int (&drain_fds)[2], const WaitDrainingOptions & options, size_t stdout_bytes_drained)
+{
     /// A caller that does not want the exit status wants only what the child says on stderr on
     /// its way out. Two kinds of child have to be told apart by what they do with stdout in the
     /// meantime. One writes a stray line past the rows it was asked for and then its diagnostic to
@@ -1225,6 +1315,82 @@ bool ShellCommand::waitDrainingOutput(const WaitDrainingOptions & options)
     /// stays open unless the caller explicitly abandoned the output early, such as under `LIMIT`.
     /// In that case the actual exit status, including a possible `SIGPIPE`, is still checked.
     static constexpr size_t stray_stdout_limit = 64 * 1024;
+
+    /// An abandoned output is also closed once `command_termination_timeout` has passed,
+    /// however little arrived: a producer that writes slowly would otherwise take hours to
+    /// reach the limit, and keep the query waiting for all of them. A command that is still
+    /// writing then dies on its next write; one that has stopped writing and only takes its
+    /// time to exit does not notice, and is waited for as long as it takes.
+    const bool stdout_abandoned_for_good = (!options.check_exit_status || options.limit_stdout_drain)
+        && (stdout_bytes_drained > stray_stdout_limit || (options.limit_stdout_drain && remainingTerminationTimeoutMs() == 0));
+    if (!stdout_abandoned_for_good || drain_fds[0] < 0)
+        return false;
+
+    /// A stdout the command has already closed itself is its own EOF, not ours: dropped
+    /// from the set, and the exit grace of `waitDrainingOutput` still applies to it.
+    bool closed_here = false;
+    if (!pipeHasEnded(drain_fds[0]))
+    {
+        out.close();
+        closed_here = true;
+    }
+    drain_fds[0] = -1;
+    return closed_here;
+}
+
+void ShellCommand::waitForExitLeavingUnreaped(int exit_fd, UInt64 timeout_ms) const
+{
+    if (exit_fd >= 0)
+    {
+        pollfd pfd{};
+        pfd.fd = exit_fd;
+        pfd.events = POLLIN;
+        if (::poll(&pfd, 1, static_cast<int>(timeout_ms)) < 0 && errno != EINTR)
+            throw ErrnoException(ErrorCodes::CANNOT_WAITPID, "Cannot wait for shell command pid {}", pid);
+        return;
+    }
+
+    /// `NOT_OUR_CHILD` is left to the reap at the top of the loop of `waitDrainingOutput`, which
+    /// forgets the child.
+    if (waitForPidMilliseconds(pid, timeout_ms, /*leave_unreaped=*/ true) == WaitForPidResult::ERROR)
+        throw Exception(ErrorCodes::CANNOT_WAITPID, "Cannot wait for shell command pid {}", pid);
+}
+
+bool ShellCommand::waitInExitGrace(UInt64 & exit_grace_deadline_ns, int exit_fd) const
+{
+    static constexpr UInt64 exit_grace_ms = 1000;
+    static constexpr UInt64 exit_grace_step_ms = 100;
+    if (exit_grace_deadline_ns == 0)
+        exit_grace_deadline_ns = monotonicDeadlineNs(exit_grace_ms);
+    if (const UInt64 grace_left_ms = millisecondsUntil(exit_grace_deadline_ns))
+    {
+        waitForExitLeavingUnreaped(exit_fd, std::min(exit_grace_step_ms, grace_left_ms));
+        return true;
+    }
+    return false;
+}
+
+bool ShellCommand::waitDrainingOutput(const WaitDrainingOptions & options)
+{
+    const auto & stderr_sink = options.stderr_sink;
+    const bool check_exit_status = options.check_exit_status;
+    const bool unbounded_status_wait = options.unbounded_status_wait;
+
+    LOG_TRACE(getLogger(), "Will wait for shell command pid {} while draining its output", pid);
+    /// A child that writes past what the protocol asked of it fills the pipe and blocks in `write`.
+    /// Nothing reads that pipe any more by the time this is called, so the only way the child ever
+    /// reaches its own exit is if the bytes keep being taken off the pipe here and thrown away.
+    static constexpr UInt64 poll_step_ms = 5;
+
+    /// The descriptors still worth draining, in the order they are polled. One that has hung up or
+    /// reached EOF is dropped out of the set (-1, which `poll` ignores): `poll` reports a hung-up
+    /// descriptor immediately and forever, so a child that closed its own output and then lingered
+    /// would otherwise spin a core here for the whole termination budget.
+    int drain_fds[2] = {out.getFD(), err.getFD()};
+
+    /// What has come off stdout, and whether it has been closed here: a stdout that floods past
+    /// what was asked of it, or that the caller abandoned, is closed rather than drained
+    /// (`closeAbandonedStdout`).
     size_t stdout_bytes_drained = 0;
     bool stdout_closed_here = false;
     /// Set once the child's output has ended and the budget has run out - see below.
@@ -1245,58 +1411,12 @@ bool ShellCommand::waitDrainingOutput(const WaitDrainingOptions & options)
     static constexpr UInt64 exit_fd_step_ms = 100;
     const UInt64 wait_step_ms = exit_fd >= 0 ? exit_fd_step_ms : poll_step_ms;
 
-    /// Waits up to `timeout_ms` for the child to exit, leaving it unreaped for the loop to collect -
-    /// on the `pidfd` already open when there is one.
-    auto wait_for_exit = [&](UInt64 timeout_ms)
-    {
-        if (exit_fd >= 0)
-        {
-            pollfd pfd{};
-            pfd.fd = exit_fd;
-            pfd.events = POLLIN;
-            if (::poll(&pfd, 1, static_cast<int>(timeout_ms)) < 0 && errno != EINTR)
-                throw ErrnoException(ErrorCodes::CANNOT_WAITPID, "Cannot wait for shell command pid {}", pid);
-            return;
-        }
-
-        /// `NOT_OUR_CHILD` is left to the reap at the top of the loop, which forgets the child.
-        if (waitForPidMilliseconds(pid, timeout_ms, /*leave_unreaped=*/ true) == WaitForPidResult::ERROR)
-            throw Exception(ErrorCodes::CANNOT_WAITPID, "Cannot wait for shell command pid {}", pid);
-    };
-
     while (true)
     {
-        if (check_cancelled)
-        {
-            try
-            {
-                check_cancelled();
-            }
-            catch (...)
-            {
-                endTerminationGracePeriod();
-                throw;
-            }
-        }
+        checkCancelled(options.check_cancelled);
 
-        /// An abandoned output is also closed once `command_termination_timeout` has passed,
-        /// however little arrived: a producer that writes slowly would otherwise take hours to
-        /// reach the limit, and keep the query waiting for all of them. A command that is still
-        /// writing then dies on its next write; one that has stopped writing and only takes its
-        /// time to exit does not notice, and is waited for as long as it takes.
-        const bool stdout_abandoned_for_good = (!check_exit_status || limit_stdout_drain)
-            && (stdout_bytes_drained > stray_stdout_limit || (limit_stdout_drain && remainingTerminationTimeoutMs() == 0));
-        if (stdout_abandoned_for_good && drain_fds[0] >= 0)
-        {
-            /// A stdout the command has already closed itself is its own EOF, not ours: dropped
-            /// from the set, and the exit grace below still applies to it.
-            if (!pipeHasEnded(drain_fds[0]))
-            {
-                out.close();
-                stdout_closed_here = true;
-            }
-            drain_fds[0] = -1;
-        }
+        if (closeAbandonedStdout(drain_fds, options, stdout_bytes_drained))
+            stdout_closed_here = true;
 
         /// Reaped WITHOUT closing the pipes. Reaping is what makes the rest of what the child wrote
         /// final - its write ends are gone, so the pipes now hold exactly its last words and
@@ -1309,7 +1429,7 @@ bool ShellCommand::waitDrainingOutput(const WaitDrainingOptions & options)
         /// door the unread bytes are still behind. The status is kept and decoded below, after the
         /// pipes have been read and closed, so `printf boom >&2; kill -TERM $$` reports both the
         /// signal and what the command said before it.
-        auto proc_status = tryWaitImpl(/*blocking=*/ false, /*check_exit_status=*/ false, /*close_streams=*/ false);
+        auto proc_status = tryWaitImpl({.blocking = false, .check_exit_status = false, .close_streams = false});
         if (proc_status.is_process_terminated)
         {
             /// What the pipes hold at this moment is the command's last words, and it is read
@@ -1353,18 +1473,8 @@ bool ShellCommand::waitDrainingOutput(const WaitDrainingOptions & options)
             /// `command_termination_timeout` of zero) into a race. Such a child gets a short grace
             /// on top, in steps that come back here - for cancellation, and for the reap above. One
             /// that closed its output and goes on living is not given more than that.
-            if (!stdout_closed_here && outputPipesHaveEnded(drain_fds))
-            {
-                static constexpr UInt64 exit_grace_ms = 1000;
-                static constexpr UInt64 exit_grace_step_ms = 100;
-                if (exit_grace_deadline_ns == 0)
-                    exit_grace_deadline_ns = monotonicDeadlineNs(exit_grace_ms);
-                if (const UInt64 grace_left_ms = millisecondsUntil(exit_grace_deadline_ns))
-                {
-                    wait_for_exit(std::min(exit_grace_step_ms, grace_left_ms));
-                    continue;
-                }
-            }
+            if (!stdout_closed_here && outputPipesHaveEnded(drain_fds) && waitInExitGrace(exit_grace_deadline_ns, exit_fd))
+                continue;
             return false;
         }
 
@@ -1380,7 +1490,7 @@ bool ShellCommand::waitDrainingOutput(const WaitDrainingOptions & options)
             /// least every `exit_wait_step_ms` to check for cancellation and the budget: there is
             /// nothing on the pipes to come back for sooner.
             static constexpr UInt64 exit_wait_step_ms = 100;
-            wait_for_exit(unbounded ? exit_wait_step_ms : std::min(remaining_ms, exit_wait_step_ms));
+            waitForExitLeavingUnreaped(exit_fd, unbounded ? exit_wait_step_ms : std::min(remaining_ms, exit_wait_step_ms));
             continue;
         }
 
@@ -1453,7 +1563,7 @@ void ShellCommand::closeInputs()
 
 void ShellCommand::wait()
 {
-    int retcode = tryWaitImpl(true).retcode;
+    int retcode = tryWaitImpl({.blocking = true}).retcode;
     handleProcessRetcode(retcode);
 }
 

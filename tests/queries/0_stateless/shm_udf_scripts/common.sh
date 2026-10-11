@@ -40,6 +40,16 @@ function shm_pages()
     echo $(( ($1 + SHM_PAGE - 1) / SHM_PAGE * SHM_PAGE ))
 }
 
+# A function of the shared-memory transport, as a `<function>` element for `shm_functions`: the name,
+# the type, the options that make it what it is, the command, the arguments (one `UInt64` if not
+# given), the format (`TabSeparated` if not given).
+function shm_function()
+{
+    echo "<function><type>$2</type><name>$1</name><return_type>String</return_type>"
+    echo "${5-<argument><type>UInt64</type></argument>}<format>${6:-TabSeparated}</format>"
+    echo "<use_shared_memory>1</use_shared_memory>$3<command>$4</command></function>"
+}
+
 # Writes the functions read from stdin - `<function>` elements - as the configuration of the next
 # `shm_local`.
 function shm_functions()
@@ -126,4 +136,43 @@ function shm_output_contains()
 function shm_log_contains()
 {
     grep -qF -- "$1" "$SHM_UDF_WORK/local.log" && echo 1 || echo 0
+}
+
+# Like `shm_local`, in a process that listens on HTTP and has a user `other` that may select anything:
+# the queries can send queries of that user to the same process (`shm_as_user`), and so to the same
+# pools.
+function shm_local_listening()
+{
+    shm_local "
+        CREATE USER other IDENTIFIED WITH no_password;
+        GRANT SELECT ON *.* TO other;
+        SYSTEM START LISTEN HTTP;
+        $1" --listen_host 127.0.0.1 --http_port 0 "${@:2}"
+}
+
+# A query that runs the query given as the user given, through the HTTP interface of the
+# `shm_local_listening` it is run in. `http_make_head_request` is off, because a `HEAD` request runs
+# the query too, and `url` does not retry: a retry would run the query again - on a fresh worker, say,
+# hiding a borrow that failed.
+function shm_as_user()
+{
+    echo "SELECT * FROM url('http://127.0.0.1:' || toString(getServerPort('http_port'))
+        || '/?user=$1&query=' || encodeURLComponent('$2'), TSV, 'result String') SETTINGS http_make_head_request = 0, http_max_tries = 1;"
+}
+
+# Prints `gone` once the process is gone, or a zombie waiting to be reaped - either way it runs no
+# code - and `running` if it is not within five seconds. A killed process is torn down by the kernel
+# right after the signal, so the wait is for that, bounded.
+function shm_process_state()
+{
+    local state
+    for _ in $(seq 1 50); do
+        state=$(awk '{ print $3 }' "/proc/$1/stat" 2>/dev/null)
+        if [[ -z "$state" || "$state" == Z ]]; then
+            echo "gone"
+            return
+        fi
+        sleep 0.1
+    done
+    echo "running"
 }

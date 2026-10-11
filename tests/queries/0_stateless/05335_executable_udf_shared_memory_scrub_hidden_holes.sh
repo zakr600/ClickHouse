@@ -12,7 +12,7 @@
 #
 # The pool lives as long as the process does, so both users come to the same one: one
 # `clickhouse-local` listens on HTTP and sends itself the other user's queries, as in 05333. `url`
-# does not retry here: a retry would land on the fresh worker and hide the failed borrow.
+# does not retry (`shm_as_user`): a retry would land on the fresh worker and hide the failed borrow.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -24,21 +24,12 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
     echo "<function><type>executable_pool</type><name>shm_hidden_holes</name><return_type>String</return_type>"
     echo "<argument><type>UInt64</type></argument><format>TabSeparated</format><pool_size>1</pool_size>"
     echo "<use_shared_memory>1</use_shared_memory><shared_memory_size>65536</shared_memory_size>"
-    echo "<command>shm_udf_hidden_holes.py</command></function>"
+    echo "<command>shm_udf_region.py --hide-holes</command></function>"
 } | shm_functions
 
-function as_user()
-{
-    echo "SELECT * FROM url('http://127.0.0.1:' || toString(getServerPort('http_port'))
-        || '/?user=$1&query=' || encodeURLComponent('$2'), TSV, 'result String') SETTINGS http_make_head_request = 0, http_max_tries = 1;"
-}
-
-shm_local "
-    CREATE USER other IDENTIFIED WITH no_password;
-    GRANT SELECT ON *.* TO other;
-    SYSTEM START LISTEN HTTP;
+shm_local_listening "
     SELECT shm_hidden_holes(1);
-    $(as_user other "SELECT shm_hidden_holes(1)")
-    $(as_user other "SELECT shm_hidden_holes(1)")
-" --listen_host 127.0.0.1 --http_port 0
+    $(shm_as_user other "SELECT shm_hidden_holes(1)")
+    $(shm_as_user other "SELECT shm_hidden_holes(1)")
+"
 shm_log_contains "past shared_memory_max_size (65536 bytes), while the region was being borrowed"

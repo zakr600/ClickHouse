@@ -222,13 +222,16 @@ void reserveBackingStorage(int fd, size_t size, const char * operation)
             operation);
 }
 
-}
+/// The probes of `checkSupported`, in the order it runs them. Each asks the kernel for one thing a
+/// region relies on, on a probe `memfd`, and throws `NOT_IMPLEMENTED` if it is not there - so that
+/// a system that lacks it is reported once, when the function is loaded, rather than on every call.
 
-void SharedMemoryRegion::checkSupported()
+/// Rather than trusting that the kernel offers sealing, ask it: an old kernel or a restricted
+/// container may have `memfd_create` without `MFD_ALLOW_SEALING`, and a region that cannot be
+/// sealed is a region the command can shrink under the server. Returns the probe descriptor, which
+/// the caller closes.
+int createSealableProbeMemfd()
 {
-    /// Rather than trusting that the kernel offers sealing, ask it: an old kernel or a restricted
-    /// container may have `memfd_create` without `MFD_ALLOW_SEALING`, and a region that cannot be
-    /// sealed is a region the command can shrink under the server.
     int fd = memfdCreate("clickhouse_udf_shm_probe", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (fd == -1)
     {
@@ -238,26 +241,32 @@ void SharedMemoryRegion::checkSupported()
             saved_errno,
             "Shared-memory regions for executable UDFs need memfd_create with sealing, which this system does not provide");
     }
-    SCOPE_EXIT({ closeNoThrow(fd, "support probe"); });
+    return fd;
+}
 
-    /// Every region reserves its pages with `posix_fallocate`, which a seccomp profile may refuse
-    /// (`EPERM`, or `EOPNOTSUPP` from a filter that lies about it); ask with one page, so that this
-    /// too fails at configuration time rather than on every call. Whatever the reason, it is
-    /// reported as the transport being unavailable here - this is a probe, and a refusal of one
-    /// page is not the machine running out of memory.
+/// Every region reserves its pages with `posix_fallocate`, which a seccomp profile may refuse
+/// (`EPERM`, or `EOPNOTSUPP` from a filter that lies about it); ask with one page, so that this
+/// too fails at configuration time rather than on every call. Whatever the reason, it is
+/// reported as the transport being unavailable here - this is a probe, and a refusal of one
+/// page is not the machine running out of memory.
+void probeFallocate(int fd)
+{
     const int fallocate_error = fallocateUpTo(fd, static_cast<size_t>(getPageSize()));
     if (fallocate_error != 0)
         ErrnoException::throwWithErrno(
             ErrorCodes::NOT_IMPLEMENTED,
             fallocate_error,
             "Shared-memory regions for executable UDFs need posix_fallocate on a memfd, which this system refuses");
+}
 
-    /// Footprints and caps are compared in the unit the kernel backs a `memfd` in (`roundUpToPages`),
-    /// which is read from `/sys/kernel/mm/transparent_hugepage`. Without `/sys/kernel/mm` at all (a
-    /// chroot, a container without `/sys`) it cannot be told, and a unit taken to be the page while
-    /// the kernel backs the file in larger folios would charge a region for less than it holds - so
-    /// the transport is refused rather than run on a guess. (`/sys/kernel/mm` without
-    /// `transparent_hugepage` is a kernel without transparent huge pages, where the page is right.)
+/// Footprints and caps are compared in the unit the kernel backs a `memfd` in (`roundUpToPages`),
+/// which is read from `/sys/kernel/mm/transparent_hugepage`. Without `/sys/kernel/mm` at all (a
+/// chroot, a container without `/sys`) it cannot be told, and a unit taken to be the page while
+/// the kernel backs the file in larger folios would charge a region for less than it holds - so
+/// the transport is refused rather than run on a guess. (`/sys/kernel/mm` without
+/// `transparent_hugepage` is a kernel without transparent huge pages, where the page is right.)
+void requireSysKernelMm()
+{
     if (0 != ::access("/sys/kernel/mm", R_OK | X_OK))
     {
         const int saved_errno = errno;
@@ -267,9 +276,12 @@ void SharedMemoryRegion::checkSupported()
             "Shared-memory regions for executable UDFs need /sys/kernel/mm to tell the unit a memfd is backed in, "
             "and this system does not provide it");
     }
+}
 
-    /// And what the kernel actually committed for that page is a lower bound for the unit, whatever
-    /// `/sys` says: never lowered by this, only raised.
+/// And what the kernel actually committed for the page `probeFallocate` asked for is a lower bound
+/// for the unit, whatever `/sys` says: never lowered by this, only raised.
+void observeProbeBackingUnit(int fd)
+{
     struct stat probe_stat{};
     if (0 != ::fstat(fd, &probe_stat))
     {
@@ -279,8 +291,13 @@ void SharedMemoryRegion::checkSupported()
     observeBackingUnit(static_cast<size_t>(probe_stat.st_blocks) * 512);
     /// The `/sys` part is read now, once, so that a knob that cannot be read or parsed fails the load
     /// of the function rather than a query.
-    roundUpToPages(0);
+    SharedMemoryRegion::roundUpToPages(0);
+}
 
+/// Adds the seals every region carries (`REGION_SEALS`), so that the probes after this one run
+/// under them, as they would on a region.
+void probeSealing(int fd)
+{
     if (0 != ::fcntl(fd, F_ADD_SEALS, REGION_SEALS))
     {
         const int saved_errno = errno;
@@ -289,13 +306,16 @@ void SharedMemoryRegion::checkSupported()
             saved_errno,
             "Shared-memory regions for executable UDFs need file sealing, which this system does not provide");
     }
+}
 
-    /// A region's pages are freed with `FALLOC_FL_PUNCH_HOLE` when the server drops it - at the
-    /// moment its charge is dropped (`releasePagesNoThrow`) - and when it is cleared for another
-    /// borrower (`releasePagesUpToLength`). A system that allows `posix_fallocate` but not the hole
-    /// punch would load the function and then keep pages nobody is charged for, so ask here, under
-    /// the seals the region has, and check by the pages the file holds afterwards that the pages
-    /// are really gone: a filter can answer success without doing anything.
+/// A region's pages are freed with `FALLOC_FL_PUNCH_HOLE` when the server drops it - at the
+/// moment its charge is dropped (`releasePagesNoThrow`) - and when it is cleared for another
+/// borrower (`releasePagesUpToLength`). A system that allows `posix_fallocate` but not the hole
+/// punch would load the function and then keep pages nobody is charged for, so ask here, under
+/// the seals the region has, and check by the pages the file holds afterwards that the pages
+/// are really gone: a filter can answer success without doing anything.
+void probePunchHole(int fd)
+{
     if (0 != punchWholeFile(fd))
     {
         const int saved_errno = errno;
@@ -316,12 +336,15 @@ void SharedMemoryRegion::checkSupported()
             "Shared-memory regions for executable UDFs need fallocate with FALLOC_FL_PUNCH_HOLE to free the pages of a memfd, "
             "and on this system it does not: {} bytes are still held after it",
             static_cast<size_t>(punched_stat.st_blocks) * 512);
+}
 
-    /// The command reaches its region by opening `/proc/self/fd/N`, so a system without `procfs`
-    /// (a bare `chroot`, a container without it mounted) would load the function and then fail
-    /// every call. Ask here instead, the way the command will: open the probe through its own
-    /// `/proc/self/fd` entry and check that this leads to the same file.
-    int reopened = ::open(pathForChildFd(fd).c_str(), O_RDWR | O_CLOEXEC);
+/// The command reaches its region by opening `/proc/self/fd/N`, so a system without `procfs`
+/// (a bare `chroot`, a container without it mounted) would load the function and then fail
+/// every call. Ask here instead, the way the command will: open the probe through its own
+/// `/proc/self/fd` entry and check that this leads to the same file.
+void probeReopenThroughProcSelfFd(int fd)
+{
+    int reopened = ::open(SharedMemoryRegion::pathForChildFd(fd).c_str(), O_RDWR | O_CLOEXEC);
     if (reopened == -1)
     {
         const int saved_errno = errno;
@@ -343,6 +366,21 @@ void SharedMemoryRegion::checkSupported()
     if (original_stat.st_dev != reopened_stat.st_dev || original_stat.st_ino != reopened_stat.st_ino)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
             "Shared-memory regions for executable UDFs need /proc/self/fd to lead to the descriptor it names, and on this system it does not");
+}
+
+}
+
+void SharedMemoryRegion::checkSupported()
+{
+    const int fd = createSealableProbeMemfd();
+    SCOPE_EXIT({ closeNoThrow(fd, "support probe"); });
+
+    probeFallocate(fd);
+    requireSysKernelMm();
+    observeProbeBackingUnit(fd);
+    probeSealing(fd);
+    probePunchHole(fd);
+    probeReopenThroughProcSelfFd(fd);
 }
 
 SharedMemoryRegion::SharedMemoryRegion(size_t size)

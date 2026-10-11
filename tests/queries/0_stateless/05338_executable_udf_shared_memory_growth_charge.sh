@@ -24,7 +24,7 @@ FAR=67108864
     echo "<argument><type>UInt64</type></argument><format>TabSeparated</format>"
     echo "<use_shared_memory>1</use_shared_memory><shared_memory_size>4096</shared_memory_size>"
     echo "<shared_memory_max_size>134217728</shared_memory_max_size>"
-    echo "<command>shm_udf_alloc_beyond_eof.py $FAR $FAR</command></function>"
+    echo "<command>shm_udf_region.py --alloc-beyond-eof $FAR $FAR</command></function>"
 } | shm_functions
 
 # 500 rows: the input fits into the first page, the input and the answer next to it do not, so the

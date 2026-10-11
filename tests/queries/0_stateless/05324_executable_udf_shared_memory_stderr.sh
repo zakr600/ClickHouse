@@ -21,36 +21,28 @@ STRAY_BYTE_MARKER="$SHM_UDF_WORK/stray_byte_written"
 # The signal a command waits for before its late output (`go_signal.py`), sent with `shm_wait.sh touch`.
 GO="$SHM_UDF_WORK/go"
 
-function shm_function()
 {
-    # name, type, the options that make it what it is, the command
-    echo "<function><type>$2</type><name>$1</name><return_type>String</return_type>"
-    echo "<argument><type>UInt64</type></argument><format>TabSeparated</format>"
-    echo "<use_shared_memory>1</use_shared_memory>$3<command>$4</command></function>"
-}
-
-{
-    shm_function shm_late_exit executable_pool "<pool_size>1</pool_size><shared_memory_size>65536</shared_memory_size>" "shm_udf_stderr_then_late_exit.py --go $GO"
-    shm_function shm_chatty executable_pool "<pool_size>1</pool_size><shared_memory_size>4096</shared_memory_size>" shm_udf_chatty.py
+    shm_function shm_late_exit executable_pool "<pool_size>1</pool_size><shared_memory_size>65536</shared_memory_size>" "shm_udf_noisy.py --report-pid --go $GO --after-answer last-words"
+    shm_function shm_chatty executable_pool "<pool_size>1</pool_size><shared_memory_size>4096</shared_memory_size>" "shm_udf_noisy.py --stdout-after-frame byte"
     shm_function shm_flood_after_gap_throw executable_pool \
         "<pool_size>1</pool_size><stderr_reaction>throw</stderr_reaction><command_read_timeout>5000</command_read_timeout><shared_memory_size>4096</shared_memory_size>" \
-        "shm_udf_stderr_flood_after_gap.py --go $GO"
+        "shm_udf_noisy.py --report-pid --go $GO --after-answer stderr-flood"
     shm_function shm_flood_after_gap_none executable_pool \
         "<pool_size>1</pool_size><stderr_reaction>none</stderr_reaction><command_read_timeout>5000</command_read_timeout><shared_memory_size>4096</shared_memory_size>" \
-        "shm_udf_stderr_flood_after_gap.py --go $GO"
+        "shm_udf_noisy.py --report-pid --go $GO --after-answer stderr-flood"
     shm_function shm_flood_none executable_pool \
         "<pool_size>1</pool_size><stderr_reaction>none</stderr_reaction><command_read_timeout>5000</command_read_timeout><shared_memory_size>4096</shared_memory_size>" \
-        shm_udf_stderr_flood_none.py
+        "shm_udf_noisy.py --report-pid --after-answer stderr-flood"
     shm_function shm_stray_byte executable_pool "<pool_size>1</pool_size><shared_memory_size>12288</shared_memory_size>" \
-        "shm_udf_stray_byte_after_probe.py --marker $STRAY_BYTE_MARKER --go $GO"
+        "shm_udf_noisy.py --after-answer stray-byte --marker $STRAY_BYTE_MARKER --go $GO"
     shm_function shm_chatty_stderr_log executable_pool \
-        "<pool_size>1</pool_size><stderr_reaction>log_last</stderr_reaction><shared_memory_size>16777216</shared_memory_size>" shm_udf_chatty_stderr.py
-    shm_function shm_flooding_stdout executable_pool "<pool_size>1</pool_size><shared_memory_size>4096</shared_memory_size>" shm_udf_flooding_stdout.py
+        "<pool_size>1</pool_size><stderr_reaction>log_last</stderr_reaction><shared_memory_size>16777216</shared_memory_size>" "shm_udf_noisy.py --report-pid --stderr-before-frame line"
+    shm_function shm_flooding_stdout executable_pool "<pool_size>1</pool_size><shared_memory_size>4096</shared_memory_size>" "shm_udf_noisy.py --report-pid --stdout-after-frame flood"
     shm_function shm_flooding_stderr executable_pool \
-        "<pool_size>1</pool_size><stderr_reaction>none</stderr_reaction><shared_memory_size>4096</shared_memory_size>" shm_udf_flooding_stderr.py
+        "<pool_size>1</pool_size><stderr_reaction>none</stderr_reaction><shared_memory_size>4096</shared_memory_size>" "shm_udf_noisy.py --report-pid --stderr-before-frame flood"
     shm_function shm_busy_chatty_throw executable_pool \
-        "<pool_size>1</pool_size><stderr_reaction>throw</stderr_reaction><shared_memory_size>4096</shared_memory_size>" shm_udf_busy_chatty.py
-    shm_function shm_quiet_stderr executable_pool "<pool_size>1</pool_size><shared_memory_size>4096</shared_memory_size>" shm_udf_quiet_stderr.py
+        "<pool_size>1</pool_size><stderr_reaction>throw</stderr_reaction><shared_memory_size>4096</shared_memory_size>" "shm_udf_noisy.py --report-pid --burn-cpu --stdout-after-frame byte"
+    shm_function shm_quiet_stderr executable_pool "<pool_size>1</pool_size><shared_memory_size>4096</shared_memory_size>" "shm_udf_noisy.py --report-pid --close-stderr"
 } | shm_functions
 
 echo "--- a worker that died in the pool has its last words reported"
